@@ -1,0 +1,206 @@
+/* 1. Base Setup & Background */
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
+    min-height: 100vh;
+    color: #111827;
+}
+
+/* 2. Main Container & Card */
+.auth-container {
+    display: flex;
+    justify-content: center;
+    /* Changed from center to flex-start so tall dashboards don't get cut off at the top */
+    align-items: flex-start; 
+    padding: 40px 20px;
+    min-height: 100vh;
+    box-sizing: border-box;
+}
+
+.auth-card {
+    background: white;
+    padding: 40px;
+    width: 100%;
+    max-width: 600px; /* Made wider to accommodate horizontal rows */
+    border-radius: 12px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 10px 15px -3px rgba(0, 0, 0, 0.05);
+    border: 1px solid #f3f4f6;
+    box-sizing: border-box;
+}
+
+.auth-card input:not(:last-of-type) {
+    margin-bottom: 24px;
+}
+
+/* 3. Typography */
+.auth-card h2 {
+    margin-top: 0;
+    margin-bottom: 24px;
+    font-size: 26px;
+    font-weight: 700;
+    text-align: center;
+}
+
+.auth-card h4 {
+    margin-top: 0;
+    margin-bottom: 12px;
+    font-size: 16px;
+    font-weight: 600;
+    color: #374151;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 8px;
+}
+
+/* 4. Form Inputs & API Box */
+.form-control {
+    width: 100%;
+    height: 46px;
+    padding: 0 16px;
+    border-radius: 8px;
+    border: 1px solid #d1d5db;
+    background-color: #f9fafb;
+    font-size: 15px;
+    color: #1f2937;
+    transition: all 0.2s ease;
+    box-sizing: border-box;
+}
+
+.form-control:focus {
+    outline: none;
+    border-color: #2563eb;
+    background-color: #ffffff;
+    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
+}
+
+.api-key-box {
+    background-color: #fffbeb;
+    border: 1px solid #fcd34d;
+    padding: 16px;
+    border-radius: 8px;
+    margin-top: 16px;
+}
+
+.api-key-box p {
+    margin: 0 0 8px 0;
+    color: #b45309;
+    font-size: 14px;
+}
+
+.api-key-box textarea {
+    width: 100%;
+    height: 70px;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #fcd34d;
+    background: #ffffff;
+    resize: none;
+    font-family: monospace;
+    font-size: 13px;
+    box-sizing: border-box;
+}
+
+/* 5. Horizontal Token Card (The Dashboard Rows) */
+.token-card {
+    display: flex;
+    flex-direction: row;
+    align-items: center; /* Vertically centers text and buttons */
+    justify-content: space-between; /* Spreads elements evenly */
+    background: #ffffff;
+    padding: 16px;
+    margin-bottom: 12px;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    gap: 16px; /* Space between the 3 elements */
+}
+
+/* Targets the Event Type text */
+.token-card > p:first-child {
+    flex-grow: 1; /* Pushes the status and buttons to the right */
+    margin: 0;
+    font-size: 15px;
+    color: #111827;
+}
+
+/* Targets the Status text (turns it into a badge) */
+.token-card > p:nth-child(2) {
+    margin: 0;
+    font-size: 12px;
+    color: #4b5563;
+    background-color: #f3f4f6;
+    padding: 4px 10px;
+    border-radius: 9999px;
+    font-weight: 600;
+    white-space: nowrap; /* Prevents text wrapping */
+}
+
+/* 6. Buttons */
+.btn-register {
+    width: 100%;
+    background: #2563eb;
+    border: black;
+    height: 46px;
+    color: white;
+    font-size: 15px;
+    font-weight: 600;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    margin-top: 24px;
+}
+
+.btn-register:hover {
+    background: #1d4ed8;
+}
+
+.token-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.refresh-btn, .disable-btn {
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    border: 1px solid transparent;
+}
+
+.refresh-btn {
+    background-color: #f3f4f6;
+    border-color: #d1d5db;
+    color: #374151;
+}
+
+.refresh-btn:hover { background-color: #e5e7eb; }
+
+.disable-btn {
+    background-color: #fef2f2;
+    border-color: #fca5a5;
+    color: #ef4444;
+}
+
+.disable-btn:hover { background-color: #fee2e2; }
+
+.logout-btn {
+    width: 100%;
+    background: transparent;
+    color: #ef4444;
+    border: 1px solid #ef4444;
+    height: 46px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.logout-btn:hover {
+    background-color: #fef2f2;
+}
+
+/* 7. Utility Classes used in your React code */
+.mt-2 { margin-top: 12px; }
+.mt-3 { margin-top: 24px; }
