@@ -48,8 +48,21 @@ def send_email(recipient_address: str, content: dict) -> dict:
         raise ValueError("SENDGRID_API_KEY not set in .env")
 
     subject   = content.get("subject", "Notification")
-    body_text = content.get("body", "")
-    body_html = content.get("html_body", f"<p>{body_text}</p>")
+    body_text = content.get("body")  or content.get("message")
+    # Try known keys first
+    body_text = content.get("body") or content.get("message")
+
+    # Fallback: take ANY string value from content dict
+    if not body_text:
+        for v in content.values():
+            if isinstance(v, str) and v.strip():
+                body_text = v
+                break
+    # Final safety
+    if not body_text:
+        raise ValueError(f"Invalid email content: {content}")
+    
+    body_html = content.get("html_body") or f"<p>{body_text}</p>"
 
     response = http_requests.post(
         "https://api.sendgrid.com/v3/mail/send",
