@@ -1,39 +1,19 @@
 const express = require("express")
+const axios   = require("axios")
 const mongoose = require("mongoose")
 const cors = require("cors")
 const bcrypt = require("bcrypt")
 const jwt = require("jsonwebtoken")
 const crypto = require("crypto")
-const JWT_SECRET = "your_secret_key"
-const EmployeeModel = require("./models/Employee")
+const JWT_SECRET   = "your_secret_key"
+const FASTAPI_URL  = process.env.FASTAPI_URL || "http://localhost:8000"
+const EmployeeModel = require("./models/client")
 
 const app = express()
 app.use(express.json())
 app.use(cors())
 
-mongoose.connect("mongodb://localhost:27017/employee")
-const EmployeeSchema = new mongoose.Schema({
-    name: String,
-    client_name: String,
-    email: String,
-    password: String,
-    client_id: String,
-
-    event_tokens: {
-        type: Array,
-        default: []   // 🔥 important
-    },
-
-    monthly_quota: {
-        type: Number,
-        default: 1000
-    },
-
-    quota_used: {
-        type: Number,
-        default: 0
-    }
-});
+mongoose.connect("mongodb://localhost:27017/notification_db")
 
 // -------------------- Utility Functions --------------------
 function generateClientId() {
@@ -41,7 +21,12 @@ function generateClientId() {
 }
 
 function generateApiKey() {
-    return crypto.randomBytes(32).toString("hex")
+    // nf_ prefix matches the FastAPI verify_api_key format
+    return "nf_" + crypto.randomBytes(32).toString("hex")
+}
+
+function normalizeEventType(value) {
+    return String(value || "").trim().toUpperCase()
 }
 
 // -------------------- Middleware --------------------
@@ -97,22 +82,43 @@ app.post("/register", async (req, res) => {
             ]
         });
 
-        // 🔥 GENERATE JWT HERE
+        // 🔥 GENERATE JWT
         const token = jwt.sign(
             { email: company.email, id: company._id },
             JWT_SECRET,
             { expiresIn: "1h" }
         );
 
+        // ── Sync this client to FastAPI so the API key works on /notify ──────
+        // FastAPI stores its own clients collection using SHA-256 hash of the key.
+        // We send the plain key once so FastAPI can hash and store it.
+        // This is a fire-and-forget sync — registration succeeds even if FastAPI
+        // is temporarily down (the user can re-sync later from the dashboard).
+        try {
+            await axios.post(`${FASTAPI_URL}/clients/sync`, {
+                client_id:     client_id,
+                name:          client_name || name,
+                plain_api_key: rawApiKey,
+                event_type:    "DEFAULT",
+                allowed_channels: ["email", "sms", "whatsapp", "push"],
+                monthly_quota: 100000,
+            });
+            console.log(`[SYNC] Client ${client_id} synced to FastAPI`);
+        } catch (syncErr) {
+            // Log but don't fail the registration — user can retry sync later
+            console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message);
+        }
+
         return res.status(201).json({
             status: "created",
             message: "Account created successfully",
-            token,            // 🔥 IMPORTANT
+            token,
             client_id,
-            api_key: rawApiKey
+            api_key: rawApiKey,   // nf_... key — shown ONCE, works in Swagger Authorize
         });
 
     } catch (err) {
+        console.error("[REGISTER]", err)
         return res.status(500).json({
             message: "Server error"
         });
@@ -182,9 +188,19 @@ app.get("/home", authenticate, async (req, res) => {
 // -------------------- CREATE EVENT TOKEN --------------------
 app.post("/create-token", authenticate, async (req, res) => {
     try {
-        const { event_type } = req.body
-        if (!event_type) {
+        const eventType = normalizeEventType(req.body.event_type)
+        if (!eventType) {
             return res.status(400).json({ message: "event_type required" })
+        }
+        if (eventType === "DEFAULT") {
+            return res.status(400).json({ message: "DEFAULT token already exists. Use refresh/regenerate instead." })
+        }
+        const existing = await EmployeeModel.findOne({
+            email: req.user.email,
+            "event_tokens.event_type": eventType
+        })
+        if (existing) {
+            return res.status(409).json({ message: `Token for ${eventType} already exists. Use refresh.` })
         }
         const rawKey = generateApiKey()
         const hash = await bcrypt.hash(rawKey, 10)
@@ -193,7 +209,7 @@ app.post("/create-token", authenticate, async (req, res) => {
             {
                 $push: {
                     event_tokens: {
-                        event_type,
+                        event_type: eventType,
                         api_key_hash: hash,
                         is_active: true,
                         created_at: new Date(),
@@ -202,9 +218,23 @@ app.post("/create-token", authenticate, async (req, res) => {
                 }
             }
         )
+        const user = await EmployeeModel.findOne({ email: req.user.email })
+        try {
+            await axios.post(`${FASTAPI_URL}/clients/sync`, {
+                client_id:        user.client_id,
+                name:             user.client_name || user.name,
+                plain_api_key:    rawKey,
+                event_type:       eventType,
+                allowed_channels: ["email", "sms", "whatsapp", "push"],
+                monthly_quota:    user.monthly_quota || 100000,
+            })
+            console.log(`[SYNC] create-token → FastAPI for ${user.client_id}`)
+        } catch (syncErr) {
+            console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message)
+        }
         res.json({
             message: "Token created",
-            event_type,
+            event_type: eventType,
             api_key: rawKey   // ⚠️ show only once
         })
     } catch (err) {
@@ -215,25 +245,46 @@ app.post("/create-token", authenticate, async (req, res) => {
 // -------------------- REFRESH TOKEN --------------------
 app.post("/refresh-token", authenticate, async (req, res) => {
     try {
-        const { event_type } = req.body
+        const eventType = normalizeEventType(req.body.event_type)
+        if (!eventType) {
+            return res.status(400).json({ message: "event_type required" })
+        }
         const rawKey = generateApiKey()
         const hash = await bcrypt.hash(rawKey, 10)
 
-        await EmployeeModel.updateOne(
+        const result = await EmployeeModel.updateOne(
             {
                 email: req.user.email,
-                "event_tokens.event_type": event_type
+                "event_tokens.event_type": eventType
             },
             {
                 $set: {
                     "event_tokens.$.api_key_hash": hash,
-                    "event_tokens.$.created_at": new Date()
+                    "event_tokens.$.created_at": new Date(),
+                    "event_tokens.$.is_active": true
                 }
             }
         )
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: `No token found for event_type ${eventType}` })
+        }
+        const user = await EmployeeModel.findOne({ email: req.user.email })
+        try {
+            await axios.post(`${FASTAPI_URL}/clients/sync`, {
+                client_id:        user.client_id,
+                name:             user.client_name || user.name,
+                plain_api_key:    rawKey,
+                event_type:       eventType,
+                allowed_channels: ["email", "sms", "whatsapp", "push"],
+                monthly_quota:    user.monthly_quota || 100000,
+            })
+            console.log(`[SYNC] refresh-token → FastAPI for ${user.client_id}`)
+        } catch (syncErr) {
+            console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message)
+        }
         res.json({
             message: "Token refreshed",
-            event_type,
+            event_type: eventType,
             api_key: rawKey
         })
     } catch (err) {
@@ -244,23 +295,133 @@ app.post("/refresh-token", authenticate, async (req, res) => {
 // -------------------- DISABLE TOKEN --------------------
 app.post("/disable-token", authenticate, async (req, res) => {
     try {
-        const { event_type } = req.body
-        await EmployeeModel.updateOne(
+        const eventType = normalizeEventType(req.body.event_type)
+        if (!eventType) {
+            return res.status(400).json({ message: "event_type required" })
+        }
+        const result = await EmployeeModel.updateOne(
             {
-                email: req.user.email,
-                "event_tokens.event_type": event_type
+                email: req.user.email
             },
             {
                 $set: {
-                    "event_tokens.$.is_active": false
+                    "event_tokens.$[token].is_active": false
                 }
-            }
+            },
+            {
+                arrayFilters: [{ "token.event_type": eventType, "token.is_active": { $ne: false } }]
+            },
         )
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ message: `No active token found for event_type ${eventType}` })
+        }
         res.json({
-            message: "Token disabled"
+            message: "Token disabled",
+            event_type: eventType,
         })
     } catch (err) {
         res.status(500).json({ message: "Server error" })
+    }
+});
+
+// -------------------- DELETE DISABLED TOKEN --------------------
+app.post("/delete-disabled-token", authenticate, async (req, res) => {
+    try {
+        const eventType = normalizeEventType(req.body.event_type)
+        if (!eventType) {
+            return res.status(400).json({ message: "event_type required" })
+        }
+        const result = await EmployeeModel.updateOne(
+            { email: req.user.email },
+            {
+                $pull: {
+                    event_tokens: {
+                        event_type: eventType,
+                        is_active: false,
+                    },
+                },
+            },
+        )
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ message: `No disabled token found for event_type ${eventType}` })
+        }
+        res.json({
+            message: "Disabled token deleted",
+            event_type: eventType,
+        })
+    } catch (err) {
+        res.status(500).json({ message: "Server error" })
+    }
+})
+
+// -------------------- RESYNC TO FASTAPI --------------------
+// Called from the dashboard "Sync to FastAPI" button if the initial
+// sync during registration failed (e.g. FastAPI was down).
+app.post("/sync-to-fastapi", authenticate, async (req, res) => {
+    try {
+        const user = await EmployeeModel.findOne({ email: req.user.email });
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        // Get the latest api_key from the request body (user pastes it)
+        // or generate a new one if they want to reset
+        const { plain_api_key } = req.body;
+        if (!plain_api_key) {
+            return res.status(400).json({ message: "plain_api_key is required" });
+        }
+        const event_type = req.body.event_type || "DEFAULT";
+
+        await axios.post(`${FASTAPI_URL}/clients/sync`, {
+            client_id:        user.client_id,
+            name:             user.client_name || user.name,
+            plain_api_key:    plain_api_key,
+            event_type:       event_type,
+            allowed_channels: ["email", "sms", "whatsapp", "push"],
+            monthly_quota:    user.monthly_quota || 100000,
+        });
+
+        res.json({ message: "Synced to FastAPI successfully.", client_id: user.client_id });
+    } catch (err) {
+        const detail = err.response?.data?.detail || err.message;
+        res.status(500).json({ message: "Sync failed: " + detail });
+    }
+});
+
+// -------------------- GENERATE NEW API KEY --------------------
+// Creates a fresh API key, stores hash in MongoDB, syncs to FastAPI.
+// Used by the "Regenerate API Key" button in the dashboard.
+app.post("/generate-api-key", authenticate, async (req, res) => {
+    try {
+        const user = await EmployeeModel.findOne({ email: req.user.email });
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        const newRawKey = generateApiKey();            // nf_<64hex>
+        const newHash   = await bcrypt.hash(newRawKey, 10);
+
+        // Store hash in Node.js DB (replace DEFAULT token or add fresh one)
+        await EmployeeModel.updateOne(
+            { email: req.user.email, "event_tokens.event_type": "DEFAULT" },
+            { $set: { "event_tokens.$.api_key_hash": newHash, "event_tokens.$.created_at": new Date() } }
+        );
+
+        // Sync the new key to FastAPI by calling /clients/sync directly.
+        // /clients/sync now upserts — it updates the hash if the client already
+        // exists, so the new key immediately replaces the old one in FastAPI.
+        await axios.post(`${FASTAPI_URL}/clients/sync`, {
+            client_id:        user.client_id,
+            name:             user.client_name || user.name,
+            plain_api_key:    newRawKey,
+            event_type:       "DEFAULT",
+            allowed_channels: ["email", "sms", "whatsapp", "push"],
+            monthly_quota:    user.monthly_quota || 100000,
+        });
+
+        res.json({
+            message: "API key regenerated. Save it now — shown only once.",
+            client_id: user.client_id,
+            api_key:   newRawKey,
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Server error: " + err.message });
     }
 });
 
@@ -268,5 +429,3 @@ app.post("/disable-token", authenticate, async (req, res) => {
 app.listen(3001, () => {
     console.log("Server is running on port 3001")
 })
-
-mongoose.Schema

@@ -1,10 +1,8 @@
-"""
-Celery worker — consumes notification jobs from RabbitMQ queues,
+"""Celery worker — consumes notification jobs from RabbitMQ queues,
 calls the real provider for each channel, writes delivery_logs to MongoDB.
 
 Start workers (from project root, inside venv):
-  celery -A tasks worker --loglevel=info --concurrency=4 \
-    -Q email-notify-q,sms-notify-q,whatsapp-notify-q,push-notify-q
+  celery -A tasks worker --loglevel=info --concurrency=4 -Q email-notify-q,sms-notify-q,whatsapp-notify-q,push-notify-q
 
 Provider credentials go in .env — see .env.example for all keys.
 To test only ONE channel, fill in just that channel's keys and leave the rest blank.
@@ -14,9 +12,13 @@ from celery_config import celery_app
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from typing import Optional
 import requests as http_requests
 import uuid
 import os
+import smtplib
+import html
+from email.mime.text import MIMEText
 
 load_dotenv()
 
@@ -27,13 +29,22 @@ _db = _mongo_client["notification_db"]
 notification_jobs_collection = _db["notification_jobs"]
 delivery_logs_collection     = _db["delivery_logs"]
 
-
 # ════════════════════════════════════════════════════════════════════════════
 #  PROVIDER FUNCTIONS
 #  Each function receives (recipient_address, content) and returns a dict:
 #    { provider, provider_message_id, status, error }
 #  Raise an exception on failure — the task will retry automatically.
 # ════════════════════════════════════════════════════════════════════════════
+
+def build_email_footer(user_id: str, event_type: Optional[str]) -> str:
+    """Small HTML block appended to SendGrid messages (ref + safe text)."""
+    uid = html.escape(str(user_id or "unknown"))
+    evt = html.escape(str(event_type or "notification"))
+    return (
+        '<hr style="border:none;border-top:1px solid #eee;margin:1.5em 0;" />'
+        f'<p style="font-size:11px;color:#888;">Ref: user {uid} · {evt}</p>'
+    )
+
 
 def send_email(recipient_address: str, content: dict) -> dict:
     """
@@ -62,7 +73,11 @@ def send_email(recipient_address: str, content: dict) -> dict:
     if not body_text:
         raise ValueError(f"Invalid email content: {content}")
     
-    body_html = content.get("html_body") or f"<p>{body_text}</p>"
+    user_id    = content.get("user_id") or "unknown"
+    event_type = content.get("event_type")
+    base_html  = content.get("html_body") or f"<p>{body_text}</p>"
+    footer     = build_email_footer(user_id, event_type)
+    body_html  = base_html + footer
 
     response = http_requests.post(
         "https://api.sendgrid.com/v3/mail/send",
@@ -84,38 +99,78 @@ def send_email(recipient_address: str, content: dict) -> dict:
 
     raise RuntimeError(f"SendGrid {response.status_code}: {response.text}")
 
+def send_email_smtp(recipient_address: str, content: dict) -> dict:
+    sender = os.getenv("SMTP_EMAIL")
+    password = os.getenv("SMTP_PASSWORD")
 
+    if not sender or not password:
+        raise ValueError("SMTP credentials missing")
+
+    subject = content.get("subject", "Notification")
+    body    = content.get("body", "Hello")
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"]    = sender
+    msg["To"]      = recipient_address
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
+        server.starttls()
+        server.login(sender, password)
+        server.send_message(msg)
+
+    return {
+        "provider": "SMTP",
+        "provider_message_id": f"smtp_{uuid.uuid4().hex[:10]}",
+        "status": "SENT",
+        "error": None
+    }
+    
 def send_sms(recipient_address: str, content: dict) -> dict:
     """
     SendFire SMS API.
     .env keys needed:
       SENDFIRE_API_KEY    — your SendFire API key
       SENDFIRE_SENDER_ID  — alphanumeric sender ID e.g. NOTIFY
-    SMS body is auto-truncated to 160 chars.
+
+    Character limit handling:
+      - main.py enforce_channel_limits() splits long bodies into sms_segments list.
+      - If sms_segments is present, each segment is sent as a separate SMS.
+      - Falls back to body field for single-segment messages.
+      - Body > 480 chars is rejected at API layer before reaching here.
     """
     api_key   = os.getenv("SENDFIRE_API_KEY")
     sender_id = os.getenv("SENDFIRE_SENDER_ID", "NOTIFY")
     if not api_key:
         raise ValueError("SENDFIRE_API_KEY not set in .env")
 
-    body = content.get("body", content.get("subject", "Notification"))
-    if len(body) > 160:
-        body = body[:157] + "..."
+    # Use pre-split segments if available (set by enforce_channel_limits in main.py)
+    segments = content.get("sms_segments")
+    if not segments:
+        body = content.get("body", content.get("subject", "Notification"))
+        segments = [body[:160]]   # safety fallback — should not be needed
 
-    response = http_requests.post(
-        "https://api.sendfire.co/sms/send",
-        json={"api_key": api_key, "sender_id": sender_id, "to": recipient_address, "message": body},
-        timeout=10,
-    )
-    data = response.json()
-    if response.status_code == 200 and data.get("status") == "success":
-        return {
-            "provider": "sendfire",
-            "provider_message_id": str(data.get("message_id", uuid.uuid4().hex[:10])),
-            "status": "SENT", "error": None,
-        }
-    raise RuntimeError(f"SendFire {response.status_code}: {data}")
+    message_ids = []
+    for i, segment in enumerate(segments):
+        response = http_requests.post(
+            "https://api.sendfire.co/sms/send",
+            json={"api_key": api_key, "sender_id": sender_id, "to": recipient_address, "message": segment},
+            timeout=10,
+        )
+        data = response.json()
+        if response.status_code == 200 and data.get("status") == "success":
+            message_ids.append(str(data.get("message_id", uuid.uuid4().hex[:10])))
+            print(f"[SMS] Sent segment {i+1}/{len(segments)} to {recipient_address}")
+        else:
+            raise RuntimeError(f"SendFire segment {i+1} failed {response.status_code}: {data}")
 
+    # Return combined message_id (all segment IDs joined)
+    return {
+        "provider":            "sendfire",
+        "provider_message_id": ",".join(message_ids),
+        "status":              "SENT",
+        "error":               None,
+    }
 
 def send_whatsapp(recipient_address: str, content: dict) -> dict:
     """
@@ -147,7 +202,6 @@ def send_whatsapp(recipient_address: str, content: dict) -> dict:
         }
     raise RuntimeError(f"UltraMsg error: {data}")
 
-
 def send_push(recipient_address: str, content: dict) -> dict:
     """
     Firebase Cloud Messaging (FCM) legacy HTTP API.
@@ -162,6 +216,9 @@ def send_push(recipient_address: str, content: dict) -> dict:
     title = content.get("title", content.get("subject", "Notification"))
     body  = content.get("body", "")
 
+    # Limits are enforced at the API layer (enforce_channel_limits in main.py)
+    # before the job reaches this worker — title<=65, body<=240.
+    # The [:65] and [:240] below are kept as a final safety net only.
     response = http_requests.post(
         "https://fcm.googleapis.com/fcm/send",
         headers={"Authorization": f"key={server_key}", "Content-Type": "application/json"},
@@ -180,52 +237,147 @@ def send_push(recipient_address: str, content: dict) -> dict:
     error = data.get("results", [{}])[0].get("error", "Unknown FCM error")
     raise RuntimeError(f"FCM error: {error}")
 
-
 # ── PROVIDER ROUTER ──────────────────────────────────────────────────────────
-
-PROVIDER_NAMES = {
-    "email":    "sendgrid",
-    "sms":      "sendfire",
-    "whatsapp": "ultramsg",
-    "push":     "firebase_fcm",
+PROVIDER_FUNCTIONS = {
+    "SendGrid": send_email,
+    "SMTP": send_email_smtp,
+    "SendFire": send_sms,
+    "UltraMsg": send_whatsapp,
+    "Firebase FCM": send_push,
 }
 
-PROVIDER_MAP = {
-    "email":    send_email,
-    "sms":      send_sms,
-    "whatsapp": send_whatsapp,
-    "push":     send_push,
-}
+def dispatch_with_failover(job):
+    providers = job["providers_snapshot"]
+    meta      = job.get("retry_meta", {})
 
-def dispatch_to_provider(channel: str, recipient_address: str, content: dict) -> dict:
-    fn = PROVIDER_MAP.get(channel)
+    provider_index = meta.get("provider_index", 0)
+    attempt        = meta.get("attempt", 1)
+
+    if provider_index >= len(providers):
+        raise RuntimeError("All providers exhausted")
+
+    provider = providers[provider_index]
+    provider_name = provider["provider_name"]
+    max_retries   = provider.get("max_retries", 3)
+
+    fn = PROVIDER_FUNCTIONS.get(provider_name)
+
     if not fn:
-        raise ValueError(f"Unknown channel: {channel}")
-    return fn(recipient_address, content or {})
+        raise RuntimeError(f"No function for provider {provider_name}")
 
+    try:
+        result = fn(job["recipient_address"], job.get("content") or {})
+        result["provider"] = provider_name
+        return result, None, None  # success
+
+    except Exception as e:
+        print(f"[PROVIDER] {provider_name} failed attempt {attempt}: {e}")
+
+        # Retry same provider
+        if attempt < max_retries:
+            job["retry_meta"]["attempt"] = attempt + 1
+            return None, "RETRY_SAME_PROVIDER", e
+
+        # Switch provider
+        job["retry_meta"]["provider_index"] = provider_index + 1
+        job["retry_meta"]["attempt"] = 1
+
+        if job["retry_meta"]["provider_index"] < len(providers):
+            return None, "SWITCH_PROVIDER", e
+
+        return None, "ALL_FAILED", e
+
+def push_to_dlq(job, error_code, error_message):
+    dlq_entry = {
+        "job_id": job["job_id"],
+        "notification_id": job.get("notification_id"),
+        # Keep both channel + queue metadata so DLQ UI can display source queue.
+        "channel": job.get("channel"),
+        "queue_name": job.get("queue_name"),
+
+        "recipient": {
+            "email": job.get("recipient_address"),
+            "user_id": job.get("user_id")
+        },
+        "payload": job.get("content"),
+
+        "error_code": error_code,
+        "error_type": classify_error(error_code),
+        "error_message": error_message,
+
+        "retry_count": job.get("retry_meta", {}).get("attempt", 1),
+        "max_retries": job.get("max_retries", 5),
+
+        "providers_tried": job.get("provider_history", []),
+        "providers_snapshot": job.get("providers_snapshot", []),
+        "failed_at": datetime.utcnow(),
+        "created_at": job.get("created_at", datetime.utcnow()),
+
+        "status": "DLQ",
+        "next_retry_at": compute_next_retry(error_code)
+    }
+    _db["dlq"].insert_one(dlq_entry)
+    
+def classify_error(error_code):
+    PERMANENT_ERRORS = {
+        "INVALID_EMAIL",
+        "USER_UNSUBSCRIBED",
+        "INVALID_PAYLOAD",
+        "SPAM_REJECTED",
+        "AUTH_FAILED"
+    }
+
+    if error_code in PERMANENT_ERRORS:
+        return "PERMANENT"
+    return "TRANSIENT"
+
+def compute_next_retry(error_code):
+    now = datetime.utcnow()
+
+    if error_code == "RATE_LIMIT_EXCEEDED":
+        return now + timedelta(minutes=30)
+
+    if error_code == "SMTP_TIMEOUT":
+        return now + timedelta(minutes=2)
+
+    return now + timedelta(minutes=5)    
+
+def map_exception_to_error_code(exc):
+    msg = str(exc).lower()
+
+    if "invalid" in msg:
+        return "INVALID_EMAIL"
+
+    if "timeout" in msg:
+        return "SMTP_TIMEOUT"
+
+    if "rate" in msg:
+        return "RATE_LIMIT_EXCEEDED"
+
+    if "auth" in msg:
+        return "AUTH_FAILED"
+
+    return "UNKNOWN_ERROR"
 
 # ════════════════════════════════════════════════════════════════════════════
 #  CELERY TASK
 # ════════════════════════════════════════════════════════════════════════════
-
 @celery_app.task(bind=True, max_retries=5)
 def send_notification(self, job: dict):
-    """
-    Consumes one job_doc from a RabbitMQ channel queue.
-    Dispatches to the real provider, writes delivery_log, updates job status.
-    """
+
     job_id            = job["job_id"]
     channel           = job["channel"]
     recipient_address = job.get("recipient_address")
-    attempt           = job.get("retry_policy", {}).get("current_attempt", 1)
-    max_attempts      = job.get("retry_policy", {}).get("max_attempts", 5)
-    now_ist           = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    retry_meta        = job.get("retry_meta", {})
+    attempt           = retry_meta.get("attempt", 1)
+
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
 
     print(f"\n{'─'*52}")
     print(f"[WORKER] PID {os.getpid()} | Job: {job_id}")
     print(f"         Channel:   {channel}")
     print(f"         Recipient: {recipient_address}")
-    print(f"         Attempt:   {attempt}/{max_attempts}")
+    print(f"         Attempt:   {attempt}")
 
     # Mark PROCESSING
     notification_jobs_collection.update_one(
@@ -234,80 +386,124 @@ def send_notification(self, job: dict):
     )
 
     try:
-        # ── Real provider dispatch ───────────────────────────────────────
-        result  = dispatch_to_provider(channel, recipient_address, job.get("content") or {})
-        sent_at = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        # Safe provider access
+        provider_index = job["retry_meta"].get("provider_index", 0)
 
-        # ── Write SENT delivery log ──────────────────────────────────────
-        delivery_logs_collection.insert_one({
-            "log_id":              f"log_{uuid.uuid4().hex[:12]}",
-            "job_id":              job_id,
-            "event_type":          job.get("event_type"),
-            "channel":             channel,
-            "provider":            result["provider"],
-            "provider_message_id": result["provider_message_id"],
-            "status":              "SENT",
-            "attempt_number":      attempt,
-            "sent_at":             sent_at,
-            "delivered_at":        None,   # filled by provider webhook (future sprint)
-            "read_at":             None,   # filled by open-pixel / push ACK (future sprint)
-            "latency_ms":          None,
-            "error":               None,
-            "created_at":          sent_at,
-        })
+        if provider_index >= len(job["providers_snapshot"]):
+            raise RuntimeError("Invalid provider index")
 
-        # ── Mark job SENT ────────────────────────────────────────────────
-        notification_jobs_collection.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "SENT", "updated_at": sent_at}},
-        )
+        provider = job["providers_snapshot"][provider_index]
+        provider_name = provider["provider_name"]
 
-        print(f"[WORKER] ✓ SENT via {result['provider']} | msg_id: {result['provider_message_id']}")
+        # Call dispatcher
+        result, action, error = dispatch_with_failover(job)
 
-    except Exception as exc:
-        # ── Retry with exponential backoff ───────────────────────────────
-        backoff     = job.get("retry_policy", {}).get("backoff_seconds", [10, 30, 120, 600, 1800])
-        countdown   = backoff[min(attempt - 1, len(backoff) - 1)]
-        failed_at   = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        # Track provider AFTER dispatch decision
+        job.setdefault("provider_history", []).append(provider_name)
 
-        print(f"[WORKER] ✗ FAILED (attempt {attempt}/{max_attempts}): {exc}")
+        # ───────────────── SUCCESS ─────────────────
+        if result:
+            sent_at = datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-        # Update job status + attempt counter
-        notification_jobs_collection.update_one(
-            {"job_id": job_id},
-            {"$set": {
-                "status":                       "FAILED",
-                "retry_policy.current_attempt": attempt + 1,
-                "updated_at":                   failed_at,
-            }},
-        )
+            delivery_logs_collection.insert_one({
+                "log_id":              f"log_{uuid.uuid4().hex[:12]}",
+                "job_id":              job_id,
+                "event_type":          job.get("event_type"),
+                "channel":             channel,
+                "provider":            result["provider"],
+                "provider_priority":   provider.get("priority"),
+                "provider_id":         provider.get("provider_id"),
+                "provider_message_id": result["provider_message_id"],
+                "status":              "SENT",
+                "attempt_number":      attempt,
+                "sent_at":             sent_at,
+                "delivered_at":        None,
+                "read_at":             None,
+                "latency_ms":          None,
+                "error":               None,
+                "created_at":          sent_at,
+            })
 
-        # Write FAILED delivery log for this attempt
-        delivery_logs_collection.insert_one({
-            "log_id":              f"log_{uuid.uuid4().hex[:12]}",
-            "job_id":              job_id,
-            "event_type":          job.get("event_type"),
-            "channel":             channel,
-            "provider":            PROVIDER_NAMES.get(channel, "unknown"),
-            "provider_message_id": None,
-            "status":              "FAILED",
-            "attempt_number":      attempt,
-            "sent_at":             None,
-            "delivered_at":        None,
-            "read_at":             None,
-            "latency_ms":          None,
-            "error":               {"message": str(exc)},
-            "created_at":          failed_at,
-        })
-
-        if attempt >= max_attempts:
             notification_jobs_collection.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "DLQ"}},
+                {"$set": {
+                    "status": "SENT",
+                    "provider_history": job["provider_history"],
+                    "updated_at": sent_at
+                }},
             )
-            print(f"[WORKER] ✗ Max retries reached — job {job_id} moved to DLQ")
+
+            print(f"[WORKER] ✓ SENT via {result['provider']}")
             return
 
-        job["retry_policy"]["current_attempt"] = attempt + 1
-        print(f"[WORKER]   Retrying in {countdown}s ...")
-        raise self.retry(exc=exc, countdown=countdown, args=[job])
+        # ───────────── RETRY SAME PROVIDER ─────────────
+        elif action == "RETRY_SAME_PROVIDER":
+            delay = min(10 * (2 ** (job["retry_meta"]["attempt"] - 1)), 300)
+
+            notification_jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "retry_meta": job["retry_meta"],
+                    "provider_history": job["provider_history"],
+                    "updated_at": now_ist
+                }},
+            )
+
+            raise self.retry(countdown=delay, args=[job])
+
+        # ───────────── SWITCH PROVIDER ─────────────
+        elif action == "SWITCH_PROVIDER":
+            print("[WORKER] Switching provider...")
+
+            notification_jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "retry_meta": job["retry_meta"],
+                    "provider_history": job["provider_history"],
+                    "updated_at": now_ist
+                }},
+            )
+
+            raise self.retry(countdown=2, args=[job])
+
+        # ───────────── ALL FAILED ─────────────
+        elif action == "ALL_FAILED":
+            error_code = map_exception_to_error_code(error)
+            error_message = str(error)
+            existing = _db["dlq"].find_one({"job_id": job_id})
+            if not existing:
+                push_to_dlq(job, error_code, error_message)
+            
+            notification_jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "status": "DLQ",
+                    "provider_history": job["provider_history"],
+                    "updated_at": now_ist
+                }},
+            )
+
+            print("[WORKER] All providers failed → pushed to DLQ")
+            return
+
+        # ───────────── SAFETY FALLBACK ─────────────
+        else:
+            raise RuntimeError("Unknown dispatch state")
+
+    except Exception as exc:
+        if job.get("status") != "DLQ":
+            error_code = map_exception_to_error_code(exc)
+            error_message = str(exc)
+            existing = _db["dlq"].find_one({"job_id": job["job_id"]})
+            if not existing:
+                push_to_dlq(job, error_code, error_message)
+
+            notification_jobs_collection.update_one(
+                {"job_id": job_id},
+                {"$set": {
+                    "status": "DLQ",
+                    "updated_at": now_ist
+                }},
+            )
+        print(f"[WORKER] Fatal error -> DLQ: {error_message}")
+        raise exc

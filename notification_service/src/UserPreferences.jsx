@@ -257,6 +257,7 @@ export default function UserPreferences() {
     }));
 
     const payload = {
+      user_id:   userId.trim(),
       email:     email || null,
       phone:     phoneNum ? `+91${phoneNum}` : null,
       wa_number: waNum   ? `+91${waNum}`    : null,

@@ -204,3 +204,527 @@ body {
 /* 7. Utility Classes used in your React code */
 .mt-2 { margin-top: 12px; }
 .mt-3 { margin-top: 24px; }
+
+.sidebar-item {
+    padding: 10px;
+    cursor: pointer;
+    margin-top: 10px;
+    border-radius: 5px;
+}
+
+.sidebar-item:hover {
+    background-color: #334155;
+}
+
+.card {
+    padding: 20px;
+    background: #f1f5f9;
+    border-radius: 10px;
+    min-width: 120px;
+    text-align: center;
+    font-weight: bold;
+}
+
+.token-card {
+    border: 1px solid #ccc;
+    padding: 10px;
+    margin-top: 10px;
+    border-radius: 8px;
+}
+
+/* ---------------- DASHBOARD LAYOUT ---------------- */
+.dashboard-container {
+    display: flex;
+    height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+    width: 240px;
+    background: #1e293b;
+    color: white;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar h3 {
+    margin-bottom: 20px;
+    font-size: 20px;
+}
+
+/* Sidebar items */
+.sidebar-item {
+    padding: 12px 14px;
+    cursor: pointer;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    transition: all 0.2s ease;
+    font-size: 14px;
+}
+
+.sidebar-item:hover {
+    background-color: #334155;
+}
+
+/* ACTIVE TAB */
+.sidebar-item.active {
+    background-color: #2563eb;
+    font-weight: 600;
+}
+
+/* Logout button in sidebar */
+.sidebar .logout-btn {
+    margin-top: auto;
+}
+
+/* ---------------- MAIN CONTENT ---------------- */
+.main-content {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;   /* instead of full stretch */
+}
+
+/* Section headings */
+.main-content h2 {
+    margin-bottom: 20px;
+    font-size: 24px;
+}
+/* -------- HOME CARD (DASHBOARD) -------- */
+.home-container {
+    width: 100%;
+    max-width: 100%;
+    background: white;
+    padding: 24px;
+    border-radius: 12px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+/* ---------------- CARDS (Queue Stats) ---------------- */
+.card {
+    padding: 20px;
+    background: white;
+    border-radius: 12px;
+    min-width: 140px;
+    text-align: center;
+    font-weight: 600;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    border: 1px solid #e5e7eb;
+}
+.client-id-box {
+    background: #f1f5f9;
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    font-size: 14px;
+    word-break: break-all; /* prevents overflow */
+}
+
+/* -------- TOKEN CREATE SECTION -------- */
+.token-create-section {
+    margin-top: 10px;
+}
+
+.token-create-section h4 {
+    margin-bottom: 10px;
+}
+
+/* Row layout */
+.token-create-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+/* Input should NOT stretch vertically */
+.token-create-row input {
+    flex: 1;
+    height: 42px;
+}
+
+/* Button inline, not full width */
+.token-create-row button {
+    height: 42px;
+    padding: 0 16px;
+    white-space: nowrap;
+}
+/* -------- FIX GENERATE BUTTON -------- */
+.token-create-row .generate-btn {
+    width: auto !important;
+    margin-top: 0 !important;
+}
+/* ---------------- TABLE (DLQ) ---------------- */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+thead {
+    background: #f3f4f6;
+}
+
+th, td {
+    padding: 12px;
+    text-align: left;
+    font-size: 14px;
+}
+
+tr {
+    border-bottom: 1px solid #e5e7eb;
+}
+
+tr:hover {
+    background-color: #f9fafb;
+}
+
+/* ---------------- BUTTON IMPROVEMENTS ---------------- */
+button {
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 8px 14px;
+    margin-right: 8px;
+    border: none;
+    font-size: 13px;
+}
+
+button:hover {
+    opacity: 0.9;
+}
+
+/* Queue control buttons */
+button:nth-child(1) {
+    background: #facc15;
+}
+
+button:nth-child(2) {
+    background: #22c55e;
+    color: white;
+}
+
+button:nth-child(3) {
+    background: #ef4444;
+    color: white;
+}
+
+/* ---------------- TOKEN SECTION IMPROVEMENT ---------------- */
+.token-card {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px;
+    border-radius: 10px;
+    background: white;
+    border: 1px solid #e5e7eb;
+    margin-top: 10px;
+}
+
+/* Status badge improvement */
+.token-card p:nth-child(2) {
+    background: #e0f2fe;
+    color: #0369a1;
+}
+
+.generate-btn {
+    background: #10b981;   
+    color: white;
+}
+
+.generate-btn:hover {
+    background: #059669;
+}
+
+/* -------- API KEY BOX IMPROVEMENT -------- */
+.api-key-box {
+    margin-top: 20px;
+    padding: 18px;
+    border-radius: 10px;
+    background: #fff7ed;
+    border: 1px solid #fdba74;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    max-width: 100%;
+}
+
+.api-key-header {
+    font-size: 14px;
+    font-weight: 600;
+    color: #b45309;
+    margin-bottom: 12px;
+}
+
+/* container for input + button */
+.api-key-content {
+    display: flex;
+    gap: 10px;
+}
+
+/* input field */
+.api-key-input {
+    flex: 1;
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid #fdba74;
+    background: #ffffff;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+/* copy button */
+.copy-btn {
+    background: #2563eb;
+    color: white;
+    border: none;
+    padding: 10px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.copy-btn:hover {
+    background: #1d4ed8;
+}
+
+/* ---------------- INPUT IMPROVEMENT ---------------- */
+input {
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid #ccc;
+}
+
+/* ---------------- SMOOTH SCROLL ---------------- */
+.main-content {
+    scroll-behavior: smooth;
+}
+
+/* -------- STATUS BADGES -------- */
+.status {
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.status.waiting {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.status.active {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.status.failed {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+/* -------- LOG BOX -------- */
+.logs-box {
+    background: black;
+    color: #00ff9c;
+    padding: 15px;
+    border-radius: 8px;
+    font-family: monospace;
+    height: 300px;
+    overflow-y: auto;
+}
+
+/* Progress bar */
+.progress-bar {
+    height: 10px;
+    background: #e5e7eb;
+    border-radius: 10px;
+    margin-top: 10px;
+    overflow: hidden;
+}
+
+.progress-fill {
+    height: 100%;
+    background: #22c55e;
+}
+
+/* -------- STATS GRID -------- */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+/* Card improvement */
+.card p {
+    margin: 0;
+    font-size: 13px;
+    color: #6b7280;
+}
+
+.card h3 {
+    margin-top: 6px;
+    font-size: 22px;
+}
+
+/* -------- FORM GROUP -------- */
+.form-group {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 15px;
+}
+
+.form-group label {
+    font-size: 14px;
+    margin-bottom: 5px;
+    color: #444;
+}
+
+/* -------- CONTROL BUTTONS -------- */
+.control-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+/* -------- RATE LIMIT -------- */
+.rate-limit-box {
+    margin-top: 20px;
+}
+
+.rate-input-group {
+    display: flex;
+    gap: 10px;
+    margin-top: 5px;
+}
+
+/* -------- MAIN CONTAINER -------- */
+.control-container {
+    background: rgba(255, 255, 255, 0.95);
+    padding: 25px;
+    border-radius: 12px;
+    max-width: 600px;
+    margin: auto;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+}
+
+/* -------- BUTTON GROUP -------- */
+.control-buttons {
+    display: flex;
+    gap: 12px;
+    margin-top: 15px;
+}
+
+/* Make buttons equal width */
+.control-buttons .btn {
+    flex: 1;
+    padding: 10px;
+    font-weight: 600;
+}
+
+/* -------- RATE LIMIT -------- */
+.rate-limit-box {
+    margin-top: 25px;
+}
+.rate-input-group {
+    display: flex;
+    gap: 10px;
+    margin-top: 8px;
+}
+/* Input takes more space */
+.rate-input-group input {
+    flex: 2;
+}
+/* Update button styling */
+.btn-update {
+    background: linear-gradient(135deg, #6366f1, #4f46e5);
+    color: white;
+    font-weight: 600;
+    padding: 10px 16px;
+    border-radius: 6px;
+    border: none;
+    transition: 0.2s;
+}
+.btn-update:hover {
+    transform: scale(1.05);
+}
+/* DLQ Filter Container */
+.dlq-filter {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+/* Label */
+.dlq-filter label {
+    font-weight: 500;
+    font-size: 14px;
+    color: #333;
+}
+/* Dropdown */
+.dlq-filter select {
+    padding: 6px 10px;
+    font-size: 14px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background-color: #fff;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+/* Hover effect */
+.dlq-filter select:hover {
+    border-color: #888;
+}
+/* Focus effect */
+.dlq-filter select:focus {
+    border-color: #4a90e2;
+    box-shadow: 0 0 3px rgba(74, 144, 226, 0.5);
+}
+
+/* Container */
+.job-filter {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+/* Label */
+.job-filter label {
+    font-size: 14px;
+    color: black; /* soft gray */
+    font-weight: 500;
+}
+
+/* Dropdown */
+.job-filter select {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid #334155;
+    background-color: white; /* dark theme */
+    color: black;
+    font-size: 14px;
+    outline: none;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+/* Hover effect */
+.job-filter select:hover {
+    border-color: #3b82f6;
+}
+
+/* Focus effect */
+.job-filter select:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+}
+
+/* Optional: make dropdown slightly wider */
+.job-filter select {
+    min-width: 160px;
+}

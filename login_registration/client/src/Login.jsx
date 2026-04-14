@@ -34,7 +34,6 @@ function Login() {
             localStorage.setItem("token", res.data.token)
 
             setSuccessMsg("Logged in successfully")
-
             navigate("/home")
 
         } catch (err) {
