@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import axios from "axios";
 
 const API_KEY_STORAGE = "notify_x_api_key";
+const API_BASE_URL = "http://localhost:8000";
 
 const DEFAULT_JSON = `{
   "client_id": "client_001",
@@ -35,6 +36,26 @@ function getLineCount(str) {
   return str.split("\n").length;
 }
 
+function ensureAttachmentInPayload(jsonText, attachment) {
+  const parsed = JSON.parse(jsonText);
+  const next = { ...parsed };
+  const content = next.content && typeof next.content === "object" && !Array.isArray(next.content)
+    ? { ...next.content }
+    : {};
+  const attachments = Array.isArray(content.attachments) ? [...content.attachments] : [];
+
+  attachments.push({
+    file_id: attachment.file_id,
+    name: attachment.name || undefined,
+    mime_type: attachment.mime_type || undefined,
+    size_bytes: attachment.size_bytes ?? undefined,
+  });
+
+  content.attachments = attachments;
+  next.content = content;
+  return JSON.stringify(next, null, 2);
+}
+
 export default function NotifyJSONPage() {
   const [jsonInput, setJsonInput] = useState(DEFAULT_JSON);
   const [apiKey, setApiKey] = useState("");
@@ -43,6 +64,19 @@ export default function NotifyJSONPage() {
   const [toast, setToast] = useState(null);
   const [response, setResponse] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [uploadMode, setUploadMode] = useState("file");
+  const [uploadFile, setUploadFile] = useState(null);
+  const [remoteUrl, setRemoteUrl] = useState("");
+  const [uploadName, setUploadName] = useState("");
+  const [uploadMimeType, setUploadMimeType] = useState("");
+  const [uploadSizeBytes, setUploadSizeBytes] = useState("");
+  const [deliveryMode, setDeliveryMode] = useState("auto");
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [attachmentInserted, setAttachmentInserted] = useState(false);
+  const [isCompact, setIsCompact] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth < 720 : false
+  );
 
   useEffect(() => {
     try {
@@ -51,6 +85,12 @@ export default function NotifyJSONPage() {
     } catch {
       /* ignore */
     }
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => setIsCompact(window.innerWidth < 720);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
   }, []);
 
   const persistApiKey = (value) => {
@@ -84,7 +124,7 @@ export default function NotifyJSONPage() {
     setResponse(null);
     try {
       const payload = JSON.parse(jsonInput);
-      const res = await axios.post("http://localhost:8000/notify", payload, {
+      const res = await axios.post(`${API_BASE_URL}/notify`, payload, {
         headers: { "X-API-Key": apiKey.trim() },
       });
       setResponse({ ok: true, data: res.data, status: res.status });
@@ -114,6 +154,86 @@ export default function NotifyJSONPage() {
     navigator.clipboard.writeText(jsonInput);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const resetUploadForm = () => {
+    setUploadFile(null);
+    setRemoteUrl("");
+    setUploadName("");
+    setUploadMimeType("");
+    setUploadSizeBytes("");
+    setDeliveryMode("auto");
+  };
+
+  const handleUpload = async () => {
+    if (!apiKey.trim()) {
+      showToast("Enter your X-API-Key before uploading media", "error");
+      return;
+    }
+
+    if (uploadMode === "file" && !uploadFile) {
+      showToast("Choose a file to upload", "error");
+      return;
+    }
+
+    if (uploadMode === "url" && !remoteUrl.trim()) {
+      showToast("Enter a remote URL to register", "error");
+      return;
+    }
+
+    setUploading(true);
+    setUploadResult(null);
+    setAttachmentInserted(false);
+
+    try {
+      const formData = new FormData();
+      if (uploadMode === "file") {
+        formData.append("file", uploadFile);
+      } else {
+        formData.append("remote_url", remoteUrl.trim());
+      }
+      if (uploadName.trim()) formData.append("name", uploadName.trim());
+      if (uploadMimeType.trim()) formData.append("mime_type", uploadMimeType.trim());
+      if (uploadSizeBytes !== "" && !Number.isNaN(Number(uploadSizeBytes))) {
+        formData.append("size_bytes", String(Number(uploadSizeBytes)));
+      }
+      if (deliveryMode.trim()) formData.append("delivery_mode", deliveryMode);
+
+      const res = await axios.post(`${API_BASE_URL}/media/upload`, formData, {
+        headers: {
+          "X-API-Key": apiKey.trim(),
+        },
+      });
+
+      setUploadResult(res.data);
+      showToast("Media uploaded successfully", "success");
+      if (uploadMode === "file") {
+        setUploadFile(null);
+      }
+    } catch (err) {
+      const errData = err.response?.data || { detail: err.message };
+      setUploadResult({ error: errData });
+      showToast("Media upload failed", "error");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleInsertAttachment = () => {
+    if (!uploadResult?.file_id) {
+      showToast("Upload a file first to get a file_id", "error");
+      return;
+    }
+
+    try {
+      const nextJson = ensureAttachmentInPayload(jsonInput, uploadResult);
+      setJsonInput(nextJson);
+      setAttachmentInserted(true);
+      setTimeout(() => setAttachmentInserted(false), 2000);
+      showToast("Attachment inserted into payload", "success");
+    } catch {
+      showToast("Current JSON is invalid, so the attachment could not be inserted", "error");
+    }
   };
 
   return (
@@ -165,6 +285,203 @@ export default function NotifyJSONPage() {
             {showApiKey ? "Hide" : "Show"}
           </button>
         </div>
+      </div>
+
+      <div style={styles.card}>
+        <div style={{
+          ...styles.sectionHeader,
+          ...(isCompact ? styles.sectionHeaderCompact : {}),
+        }}>
+          <div>
+            <div style={styles.sectionTitle}>Media Upload</div>
+            <div style={styles.sectionHint}>
+              Upload once to get a <code style={styles.inlineCode}>file_id</code> for <code style={styles.inlineCode}>content.attachments</code>
+            </div>
+          </div>
+          <div style={{
+            ...styles.modeSwitch,
+            ...(isCompact ? styles.modeSwitchCompact : {}),
+          }}>
+            <button
+              type="button"
+              onClick={() => setUploadMode("file")}
+              style={{
+                ...styles.modeBtn,
+                ...(uploadMode === "file" ? styles.modeBtnActive : {}),
+              }}
+            >
+              Local file
+            </button>
+            <button
+              type="button"
+              onClick={() => setUploadMode("url")}
+              style={{
+                ...styles.modeBtn,
+                ...(uploadMode === "url" ? styles.modeBtnActive : {}),
+              }}
+            >
+              Remote URL
+            </button>
+          </div>
+        </div>
+
+        <div style={{
+          ...styles.uploadGrid,
+          ...(isCompact ? styles.uploadGridCompact : {}),
+        }}>
+          <div style={styles.fieldBlockWide}>
+            <label style={styles.fieldLabel}>
+              {uploadMode === "file" ? "Choose file" : "Remote URL"}
+            </label>
+            {uploadMode === "file" ? (
+              <div style={styles.filePickerWrap}>
+                <label style={styles.filePickerBtn}>
+                  <input
+                    type="file"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                    style={styles.hiddenInput}
+                  />
+                  {uploadFile ? "Change file" : "Select file"}
+                </label>
+                <div style={styles.fileMeta}>
+                  {uploadFile
+                    ? `${uploadFile.name} · ${uploadFile.size.toLocaleString()} bytes`
+                    : "No file selected"}
+                </div>
+              </div>
+            ) : (
+              <input
+                type="url"
+                value={remoteUrl}
+                onChange={(e) => setRemoteUrl(e.target.value)}
+                placeholder="https://example.com/file.pdf"
+                style={styles.fieldInput}
+              />
+            )}
+          </div>
+
+          <div style={styles.fieldBlock}>
+            <label style={styles.fieldLabel}>Name</label>
+            <input
+              type="text"
+              value={uploadName}
+              onChange={(e) => setUploadName(e.target.value)}
+              placeholder="Optional display name"
+              style={styles.fieldInput}
+            />
+          </div>
+
+          <div style={styles.fieldBlock}>
+            <label style={styles.fieldLabel}>MIME type</label>
+            <input
+              type="text"
+              value={uploadMimeType}
+              onChange={(e) => setUploadMimeType(e.target.value)}
+              placeholder="application/pdf"
+              style={styles.fieldInput}
+            />
+          </div>
+
+          <div style={styles.fieldBlock}>
+            <label style={styles.fieldLabel}>Size bytes</label>
+            <input
+              type="number"
+              min="0"
+              value={uploadSizeBytes}
+              onChange={(e) => setUploadSizeBytes(e.target.value)}
+              placeholder="Optional"
+              style={styles.fieldInput}
+            />
+          </div>
+
+          <div style={styles.fieldBlock}>
+            <label style={styles.fieldLabel}>Delivery mode</label>
+            <select
+              value={deliveryMode}
+              onChange={(e) => setDeliveryMode(e.target.value)}
+              style={styles.fieldInput}
+            >
+              <option value="auto">auto</option>
+              <option value="link_only">link_only</option>
+              <option value="provider_media">provider_media</option>
+            </select>
+          </div>
+        </div>
+
+        <div style={styles.uploadActions}>
+          <button
+            type="button"
+            onClick={handleUpload}
+            disabled={uploading || !apiKey.trim()}
+            style={{
+              ...styles.primaryActionBtn,
+              ...(uploading || !apiKey.trim() ? styles.sendBtnDisabled : {}),
+            }}
+          >
+            {uploading ? "Uploading…" : "Upload media"}
+          </button>
+          <button type="button" onClick={resetUploadForm} style={styles.secondaryActionBtn}>
+            Reset fields
+          </button>
+        </div>
+
+        {uploadResult && (
+          <div style={styles.uploadResult}>
+            <div style={styles.responseHeader}>
+              <div style={styles.toolbarLabel}>Upload result</div>
+              <span style={{
+                ...styles.statusBadge,
+                ...(uploadResult.error ? styles.statusErr : styles.statusOk),
+              }}>
+                {uploadResult.error ? "Upload Error" : "Ready"}
+              </span>
+            </div>
+
+            {uploadResult.error ? (
+              <pre style={styles.responsePre}>
+                {JSON.stringify(uploadResult.error, null, 2)}
+              </pre>
+            ) : (
+              <div style={styles.uploadSummary}>
+                <div style={styles.summaryRow}>
+                  <span style={styles.summaryLabel}>file_id</span>
+                  <code style={styles.summaryValue}>{uploadResult.file_id}</code>
+                </div>
+                <div style={styles.summaryRow}>
+                  <span style={styles.summaryLabel}>name</span>
+                  <span style={styles.summaryValue}>{uploadResult.name || "-"}</span>
+                </div>
+                <div style={styles.summaryRow}>
+                  <span style={styles.summaryLabel}>storage</span>
+                  <span style={styles.summaryValue}>{uploadResult.storage || "-"}</span>
+                </div>
+                <div style={styles.summaryRow}>
+                  <span style={styles.summaryLabel}>delivery_mode</span>
+                  <span style={styles.summaryValue}>{uploadResult.delivery_mode || "-"}</span>
+                </div>
+                <div style={styles.summaryRow}>
+                  <span style={styles.summaryLabel}>url</span>
+                  <a href={uploadResult.url} target="_blank" rel="noreferrer" style={styles.linkValue}>
+                    {uploadResult.url}
+                  </a>
+                </div>
+
+                <div style={styles.uploadActionsInline}>
+                  <button type="button" onClick={handleInsertAttachment} style={styles.primaryActionBtn}>
+                    {attachmentInserted ? "Inserted" : "Insert into JSON payload"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigator.clipboard.writeText(uploadResult.file_id)}
+                    style={styles.secondaryActionBtn}
+                  >
+                    Copy file_id
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Editor card */}
@@ -310,6 +627,61 @@ const styles = {
     borderRadius: 12,
     overflow: "hidden",
   },
+  sectionHeader: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+    padding: "14px",
+    borderBottom: "0.5px solid rgba(0,0,0,0.08)",
+    background: "#fafaf9",
+  },
+  sectionHeaderCompact: {
+    flexDirection: "column",
+    alignItems: "stretch",
+  },
+  sectionTitle: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "#222",
+    marginBottom: 4,
+  },
+  sectionHint: {
+    fontSize: 12,
+    color: "#6b6965",
+    lineHeight: 1.5,
+  },
+  inlineCode: {
+    fontFamily: "ui-monospace, monospace",
+    background: "#f2f1ee",
+    padding: "1px 5px",
+    borderRadius: 5,
+    fontSize: 11,
+  },
+  modeSwitch: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 0,
+  },
+  modeSwitchCompact: {
+    width: "100%",
+    flexWrap: "wrap",
+  },
+  modeBtn: {
+    padding: "7px 11px",
+    fontSize: 12,
+    border: "0.5px solid rgba(0,0,0,0.15)",
+    borderRadius: 999,
+    background: "#fff",
+    color: "#555",
+    cursor: "pointer",
+  },
+  modeBtnActive: {
+    background: "#111",
+    color: "#fff",
+    borderColor: "#111",
+  },
 
   apiKeyHeader: {
     display: "flex",
@@ -347,6 +719,138 @@ const styles = {
     background: "#fafaf9",
     color: "#444",
     cursor: "pointer",
+  },
+  uploadGrid: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 12,
+    padding: "14px",
+  },
+  uploadGridCompact: {
+    gridTemplateColumns: "1fr",
+  },
+  fieldBlock: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  fieldBlockWide: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    gridColumn: "1 / -1",
+  },
+  fieldLabel: {
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: ".04em",
+    textTransform: "uppercase",
+    color: "#8a867f",
+  },
+  fieldInput: {
+    width: "100%",
+    fontSize: 13,
+    padding: "10px 12px",
+    border: "0.5px solid rgba(0,0,0,0.18)",
+    borderRadius: 8,
+    outline: "none",
+    boxSizing: "border-box",
+    background: "#fff",
+    color: "#111",
+  },
+  hiddenInput: {
+    display: "none",
+  },
+  filePickerWrap: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+  },
+  filePickerBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "10px 12px",
+    border: "0.5px solid rgba(0,0,0,0.18)",
+    borderRadius: 8,
+    background: "#fff",
+    color: "#333",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  fileMeta: {
+    fontSize: 12,
+    color: "#666",
+    wordBreak: "break-word",
+  },
+  uploadActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "0 14px 14px",
+    flexWrap: "wrap",
+  },
+  primaryActionBtn: {
+    padding: "10px 14px",
+    border: "none",
+    borderRadius: 8,
+    background: "#111",
+    color: "#fff",
+    cursor: "pointer",
+    fontSize: 13,
+    fontWeight: 600,
+  },
+  secondaryActionBtn: {
+    padding: "10px 14px",
+    border: "0.5px solid rgba(0,0,0,0.18)",
+    borderRadius: 8,
+    background: "#fff",
+    color: "#444",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  uploadResult: {
+    borderTop: "0.5px solid rgba(0,0,0,0.08)",
+    background: "#fff",
+  },
+  uploadSummary: {
+    padding: "14px",
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  summaryRow: {
+    display: "grid",
+    gridTemplateColumns: "110px 1fr",
+    gap: 12,
+    alignItems: "start",
+  },
+  summaryLabel: {
+    fontSize: 11,
+    fontWeight: 700,
+    letterSpacing: ".04em",
+    textTransform: "uppercase",
+    color: "#8a867f",
+  },
+  summaryValue: {
+    fontSize: 13,
+    color: "#222",
+    wordBreak: "break-word",
+    fontFamily: "ui-monospace, monospace",
+  },
+  linkValue: {
+    fontSize: 13,
+    color: "#2d5f9a",
+    wordBreak: "break-all",
+    textDecoration: "none",
+  },
+  uploadActionsInline: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+    marginTop: 6,
   },
 
   toolbar: {

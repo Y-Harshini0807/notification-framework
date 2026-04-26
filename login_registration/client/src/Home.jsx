@@ -2,6 +2,7 @@ import { useState, useEffect } from "react"
 import axios from "axios"
 import { useNavigate } from "react-router-dom"
 import "./Auth.css"
+import ProviderSettings from "./ProviderSettings"
 
 function Home() {
     const [clientId, setClientId] = useState("")
@@ -14,23 +15,17 @@ function Home() {
     const [jobs, setJobs] = useState([])
     const [search, setSearch] = useState("")   
     const [failedJobs, setFailedJobs] = useState([])
-    useEffect(() => {
-        fetch("http://localhost:8000/dlq")
-            .then(res => res.json())
-            .then(data => {
-                console.log("DLQ API response:", data)
-                setFailedJobs(toSafeObjectArray(data?.dlq))
-            })
-            .catch(err => {
-                console.error("DLQ fetch error:", err)
-                setFailedJobs([])
-            })
-    }, [])
     const [failStats, setFailStats] = useState([])
     const [failureSummary, setFailureSummary] = useState(null)
     const [webhooks, setWebhooks] = useState([])
-    const [analyticsFromDate, setAnalyticsFromDate] = useState("")
-    const [analyticsToDate, setAnalyticsToDate] = useState("")
+    const [analyticsFromDate, setAnalyticsFromDate] = useState(() => {
+    const d = new Date()
+              d.setDate(d.getDate() - 30)
+              return d.toISOString().slice(0, 10)
+     })
+    const [analyticsToDate, setAnalyticsToDate] = useState(() => {
+              return new Date().toISOString().slice(0, 10)
+     })
     const [webhookStatusFilter, setWebhookStatusFilter] = useState("")
     const [webhookEventFilter, setWebhookEventFilter] = useState("")
     const [queueStats, setQueueStats] = useState({
@@ -43,8 +38,15 @@ function Home() {
         queues: []
     })
     const [selectedQueue, setSelectedQueue] = useState("EMAIL")
-    const [rateLimit, setRateLimit] = useState(50)
-    const [selectedJob, setSelectedJob] = useState(null);
+    const [showQueueControl, setShowQueueControl] = useState(false)
+    const [queueControlChannel, setQueueControlChannel] = useState(null) // null = closed, "EMAIL"|"SMS"|etc = open
+    // Rate limit draft for the queue control modal.
+    const [rateLimitDraft, setRateLimitDraft] = useState("0")
+    const [rateLimitTouched, setRateLimitTouched] = useState(false)
+    const [selectedClients, setSelectedClients] = useState(new Set())
+    const [clientSelectMode, setClientSelectMode] = useState(false)
+    const [selectedJob, setSelectedJob] = useState(null)
+    const [activityDetail, setActivityDetail] = useState(null)
     const [clients, setClients] = useState([])
     const [clientSearch, setClientSearch] = useState("")
     const [clientStatusFilter, setClientStatusFilter] = useState("all")
@@ -63,6 +65,60 @@ function Home() {
         }
         return String(value)
     }
+    const selectedQueueKey = String(selectedQueue || "").trim().toUpperCase()
+    const selectedQueueStats = queueStats.queues.find(
+        (q) => String(q.type || "").trim().toUpperCase() === selectedQueueKey
+    ) || null
+    const getQueueRateLimitDraft = (queueType) => {
+        const normalized = String(queueType || "").trim().toUpperCase()
+        const queueStatsEntry = queueStats.queues.find(
+            (q) => String(q.type || "").trim().toUpperCase() === normalized
+        ) || null
+        return String(Number(queueStatsEntry?.rate_limit || 0))
+    }
+    useEffect(() => {
+        if (!queueControlChannel || rateLimitTouched) return
+        setRateLimitDraft(getQueueRateLimitDraft(queueControlChannel))
+    }, [queueControlChannel, queueStats.queues, rateLimitTouched])
+    const parseBackendTimestamp = (value, assumedOffset = "") => {
+        if (!value) return null
+        if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value
+        if (typeof value === "number") {
+            const date = new Date(value)
+            return Number.isNaN(date.getTime()) ? null : date
+        }
+        if (typeof value !== "string") return null
+
+        const normalized = value.trim().replace(" ", "T")
+        const hasTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(normalized)
+        const candidate = hasTimezone ? normalized : `${normalized}${assumedOffset}`
+        const date = new Date(candidate)
+        return Number.isNaN(date.getTime()) ? null : date
+    }
+    const formatAdminTimestamp = (value, assumedOffset = "") => {
+        if (!value) return "-"
+        const date = parseBackendTimestamp(value, assumedOffset)
+        if (!date) return String(value)
+        return new Intl.DateTimeFormat(undefined, {
+            dateStyle: "medium",
+            timeStyle: "medium",
+            timeZone: "Asia/Kolkata",
+        }).format(date)
+    }
+    const formatUtcTimestamp = (value) => formatAdminTimestamp(value, "Z")
+    const SUCCESS_ACTIVITY_STATUSES = new Set(["SENT", "DELIVERED", "READ"])
+    const FAILED_ACTIVITY_STATUSES = new Set(["FAILED", "DLQ", "DROPPED", "SPAM"])
+    const formatDateTime = (value) => {
+        if (!value) return "-"
+        const date = new Date(value)
+        if (Number.isNaN(date.getTime())) return String(value)
+        return date.toLocaleString()
+    }
+    const renderFailoverReasons = (reasons) => {
+        const rows = Array.isArray(reasons) ? reasons.filter(Boolean) : []
+        if (!rows.length) return "Healthy"
+        return rows.join(", ")
+    }
     const matchesDlqQueueFilter = (job, filterValue) => {
         if (!filterValue) return true
         const normalized = String(filterValue).trim().toLowerCase()
@@ -80,17 +136,47 @@ function Home() {
         apiKey: "",
     })
     const viewJob = (job) => {
-        setSelectedJob(job);
-    };
+        setSelectedJob(job)
+    }
+    const openActivityDetail = (title, userIds, emptyMessage) => {
+        setActivityDetail({
+            title,
+            userIds: Array.isArray(userIds) ? userIds.filter(Boolean) : [],
+            emptyMessage,
+        })
+    }
+    const renderActivityLink = (label, onClick) => (
+        <button
+            type="button"
+            onClick={onClick}
+            style={{
+                background: "none",
+                border: "none",
+                padding: 0,
+                color: "#2563eb",
+                cursor: "pointer",
+                textDecoration: "underline",
+                font: "inherit",
+            }}
+        >
+            {label}
+        </button>
+    )
     const fetchDLQ = async () => {
         try {
-            const res = await axios.get("http://localhost:8000/dlq", getAuthHeader())
+            const res = await axios.get("http://localhost:8000/dlq", {
+                params: { status: "DLQ", limit: 200 },
+                ...getAuthHeader(),
+            })
             setFailedJobs(toSafeObjectArray(res.data?.dlq))
         } catch (err) {
             console.log("DLQ refresh error:", err)
             setFailedJobs([])
         }
     }
+    useEffect(() => {
+        fetchDLQ()
+    }, [])
     const fetchJobs = async () => {
         try {
             const res = await axios.get(
@@ -106,12 +192,21 @@ function Home() {
         }
     }
     useEffect(() => {
-        if (activeTab === "jobs") {
+        if (activeTab === "jobs" || activeTab === "activity") {
             fetchJobs()
         }
     }, [activeTab, clientId])
+    useEffect(() => {
+        if (activeTab === "dlq") {
+            fetchDLQ()
+        }
+    }, [activeTab])
     const navigate = useNavigate()
     const handleTabChange = (tab) => {
+        if (tab !== "stats") {
+            setShowQueueControl(false)
+            setQueueControlChannel(null)
+        }
         setActiveTab(tab)
         localStorage.setItem("client_dashboard_active_tab", tab)
     }
@@ -160,13 +255,22 @@ function Home() {
         }
         const savedTab = localStorage.getItem("client_dashboard_active_tab")
         const validTabs = new Set([
-            "home", "stats", "control", "dlq", "tokens", "jobs",
-            "logs", "rate", "analytics", "webhooks", "clients"
+            "home", "stats", "dlq", "tokens", "activity", "rate", "analytics", "webhooks", "clients", "providers"
         ])
-        if (savedTab && validTabs.has(savedTab)) setActiveTab(savedTab)
+        if (savedTab === "control") {
+            setActiveTab("stats")
+        } else if (savedTab && validTabs.has(savedTab)) {
+            setActiveTab(savedTab)
+        }
         fetchData()
         fetchQueueStats()
     }, [])
+    useEffect(() => {
+        if (activeTab !== "stats") return
+        fetchQueueStats()
+        const id = setInterval(fetchQueueStats, 5000)
+        return () => clearInterval(id)
+    }, [activeTab])
     const handleLogout = () => {
         localStorage.removeItem("token")
         navigate("/login")
@@ -200,11 +304,11 @@ function Home() {
     }
 
     // Copies text and shows brief confirmation
-    const [copied, setCopied] = useState(false)
-    const copyToClipboard = async (text) => {
+    const [copiedTarget, setCopiedTarget] = useState("")
+    const copyToClipboard = async (text, target = "default") => {
         await navigator.clipboard.writeText(text)
-        setCopied(true)
-        setTimeout(() => setCopied(false), 2000)
+        setCopiedTarget(target)
+        setTimeout(() => setCopiedTarget((current) => (current === target ? "" : current)), 2000)
     }
 
     // Legacy createToken kept for the "My Tokens" tab backward compat
@@ -327,10 +431,14 @@ function Home() {
         await axios.post("http://localhost:8000/reprocess-dlq", {}, getAuthHeader())
     }
     const updateRate = async () => {
-        await axios.post("http://localhost:8000/update-rate-limit", {
-            queue: selectedQueue,
-            rate: rateLimit
-        }, getAuthHeader())
+        await axios.post(
+            "http://localhost:8000/update-rate-limit",
+            {
+                queue: selectedQueue,
+                rate: Number(rateLimitDraft),
+            },
+            getAuthHeader()
+        )
     }
     const pauseQueue = async () => {
         try {
@@ -381,42 +489,93 @@ function Home() {
                 "http://localhost:8000/update-rate-limit",
                 {
                     queue: selectedQueue,
-                    rate: rateLimit
+                    rate: Number(rateLimitDraft)
                 },
                 getAuthHeader()
             )
 
             alert(res.data.message)
+            setRateLimitTouched(false)
+            setRateLimitDraft(String(Number(rateLimitDraft || 0)))
+            fetchQueueStats()
 
         } catch (err) {
             alert("Update failed")
         }
     }
+    const openQueueControl = (queueType) => {
+        const normalized = String(queueType || "EMAIL").trim().toUpperCase()
+        setSelectedQueue(normalized)
+        setQueueControlChannel(normalized)
+        setShowQueueControl(true)
+        setActiveTab("stats")
+        setRateLimitTouched(false)
+        setRateLimitDraft(getQueueRateLimitDraft(normalized))
+    }
     const retryJob = async (jobId) => {
         try {
-            await axios.post("http://localhost:8000/retry-job", {
+            const res = await axios.post("http://localhost:8000/retry-job", {
                 job_id: jobId
             }, getAuthHeader())
 
+            alert(res.data?.message || "Job requeued")
             fetchDLQ()  // refresh
+            return true
         } catch (err) {
             console.log(err)
+            alert(err.response?.data?.detail || "Retry failed")
+            return false
         }
     }
     const discardJob = async (jobId) => {
         try {
-            await axios.post("http://localhost:8000/discard-job", {
+            const res = await axios.post("http://localhost:8000/discard-job", {
                 job_id: jobId
             }, getAuthHeader())
 
+            alert(res.data?.message || "Job discarded")
+            fetchDLQ()
+            return true
+        } catch (err) {
+            console.log(err)
+            alert(err.response?.data?.detail || "Discard failed")
+            return false
+        }
+    }
+    const discardAllDlq = async () => {
+        const visibleCount = failedJobs.filter((job) => matchesDlqQueueFilter(job, selectedQueue)).length
+        if (!visibleCount) {
+            return alert("No DLQ jobs to discard")
+        }
+
+        const scopeLabel = selectedQueue ? `${selectedQueue} DLQ jobs` : "all DLQ jobs"
+        const confirmed = window.confirm(
+            `Discard ${visibleCount} ${scopeLabel}? This will mark them as DROPPED.`
+        )
+        if (!confirmed) return
+
+        try {
+            const res = await axios.post(
+                "http://localhost:8000/discard-dlq",
+                { channel: selectedQueue || null },
+                getAuthHeader()
+            )
+            alert(res.data?.message || "DLQ jobs discarded")
+            setSelectedJob(null)
             fetchDLQ()
         } catch (err) {
             console.log(err)
+            alert(err.response?.data?.detail || "Discard all failed")
         }
     }
     const [logs, setLogs] = useState([])
-    const [logFilter, setLogFilter] = useState("ALL")
-    const [logSearch, setLogSearch] = useState("")
+
+    // Merged Jobs + Activity filters
+    const [filterJobId, setFilterJobId] = useState("")
+    const [filterChannel2, setFilterChannel2] = useState("")
+    const [filterEventType2, setFilterEventType2] = useState("")
+    const [filterClientId2, setFilterClientId2] = useState("")
+    const [filterStatus2, setFilterStatus2] = useState("")
     const fetchLogs = async () => {
         try {
             const res = await axios.get(
@@ -431,16 +590,18 @@ function Home() {
 
             console.log("LOGS:", res.data)
 
-            const sorted = [...toSafeObjectArray(res.data?.logs)].sort(
-                (a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)
-            )
+            const sorted = [...toSafeObjectArray(res.data?.logs)].sort((a, b) => {
+                const left = parseBackendTimestamp(a.created_at, "+05:30")?.getTime() ?? 0
+                const right = parseBackendTimestamp(b.created_at, "+05:30")?.getTime() ?? 0
+                return right - left
+            })
             setLogs(sorted)
         } catch (err) {
             console.log("Logs fetch error:", err)
         }
     }
     useEffect(() => {
-        if (activeTab === "logs") {
+        if (activeTab === "activity") {
             fetchLogs()
         }
     }, [activeTab])
@@ -508,6 +669,83 @@ function Home() {
         }
     }
 
+    const deleteClientAccount = async (client) => {
+        const label = client?.client_id || "this client"
+        const confirmed = window.confirm(
+            `Delete client account ${label}? This will remove the client record and related notification data.`
+        )
+        if (!confirmed) return
+
+        try {
+            const res = await axios.delete(
+                `http://localhost:8000/clients/${client.client_id}`,
+                getAuthHeader()
+            )
+            alert(res.data.message || "Client deleted")
+            fetchClients()
+        } catch (err) {
+            alert(err.response?.data?.detail || "Failed to delete client")
+        }
+    }
+    const deleteAllClientAccounts = async () => {
+        if (!clients.length) {
+            return alert("No client accounts to delete")
+        }
+
+        const confirmation = window.prompt(
+            `Delete all ${clients.length} client account(s) and their related notification data? Type DELETE ALL to confirm.`
+        )
+        if (confirmation !== "DELETE ALL") return
+
+        try {
+            const res = await axios.delete(
+                "http://localhost:8000/clients",
+                getAuthHeader()
+            )
+            alert(res.data?.message || "Client accounts deleted")
+            setQuotaDrafts({})
+            fetchClients()
+        } catch (err) {
+            alert(err.response?.data?.detail || "Failed to delete client accounts")
+        }
+    }
+    const deleteSelectedClients = async () => {
+            if (!selectedClients.size) return alert("No clients selected")
+            const confirmed = window.confirm(
+                `Delete ${selectedClients.size} selected client(s)? This cannot be undone.`
+            )
+            if (!confirmed) return
+            try {
+                await Promise.all(
+                    [...selectedClients].map(id =>
+                        axios.delete(`http://localhost:8000/clients/${id}`, getAuthHeader())
+                    )
+                )
+                setSelectedClients(new Set())
+                fetchClients()
+            } catch (err) {
+                alert(err.response?.data?.detail || "Failed to delete some clients")
+            }
+    }
+    const deleteMyAccount = async () => {
+        const confirmed = window.confirm(
+            "Delete your admin account? This will remove your account, tokens, and related notification data from this service."
+        )
+        if (!confirmed) return
+
+        try {
+            const res = await axios.delete(
+                "http://localhost:3001/delete-account",
+                getAuthHeader()
+            )
+            alert(res.data.message || "Your account has been deleted")
+            localStorage.removeItem("token")
+            navigate("/login")
+        } catch (err) {
+            alert(err.response?.data?.message || "Failed to delete your account")
+        }
+    }
+
     useEffect(() => {
         if (activeTab === "clients") {
             fetchClients()
@@ -544,51 +782,67 @@ function Home() {
     }, [activeTab, filterClient, filterChannel, filterScope, rateLimitLimit])
 
     const fetchFailureAnalytics = async () => {
-        try {
-            const [statsRes, failedLogsRes] = await Promise.all([
-                axios.get("http://localhost:8000/stats", {
-                    params: {
-                        client_id: clientId || undefined,
-                        from_date: analyticsFromDate || undefined,
-                        to_date: analyticsToDate || undefined,
-                    },
-                    ...getAuthHeader(),
-                }),
-                axios.get("http://localhost:8000/logs", {
-                    params: {
-                        client_id: clientId || undefined,
-                        status: "FAILED",
-                        from_date: analyticsFromDate || undefined,
-                        to_date: analyticsToDate || undefined,
-                        limit: 500,
-                    },
-                    ...getAuthHeader(),
-                }),
-            ])
+    try {
+        const res = await axios.get("http://localhost:8000/logs", {
+            params: { limit: 500 },
+            ...getAuthHeader(),
+        })
 
-            const failedByEvent = {}
-            for (const row of toSafeObjectArray(failedLogsRes.data?.logs)) {
-                const key = row.event_type || "UNKNOWN"
-                failedByEvent[key] = (failedByEvent[key] || 0) + 1
-            }
-            const rows = Object.entries(failedByEvent)
-                .map(([event, count]) => ({ event, count }))
-                .sort((a, b) => b.count - a.count)
+        const allLogs = toSafeObjectArray(res.data?.logs)
 
-            setFailStats(rows)
-            setFailureSummary(statsRes.data.summary || null)
-        } catch (err) {
-            console.log("Failure analytics error:", err)
-            setFailStats([])
-            setFailureSummary(null)
+        // Apply date filter on frontend using IST offset (+05:30)
+        const from = analyticsFromDate ? new Date(analyticsFromDate + "T00:00:00+05:30") : null
+        const to   = analyticsToDate   ? new Date(analyticsToDate   + "T23:59:59+05:30") : null
+
+        const filtered = allLogs.filter(log => {
+            if (!from && !to) return true
+            const d = parseBackendTimestamp(log.created_at, "+05:30")
+            if (!d) return true
+            if (from && d < from) return false
+            if (to   && d > to)   return false
+            return true
+        })
+
+        const failedLogs = filtered.filter(log =>
+            String(log.status || "").toUpperCase() === "FAILED"
+        )
+
+        const failedByEvent = {}
+        for (const row of failedLogs) {
+            const key = row.event_type || "UNKNOWN"
+            failedByEvent[key] = (failedByEvent[key] || 0) + 1
         }
+        const rows = Object.entries(failedByEvent)
+            .map(([event, count]) => ({ event, count }))
+            .sort((a, b) => b.count - a.count)
+
+        const total  = filtered.length
+        const failed = failedLogs.length
+        const sent   = total - failed
+
+        setFailStats(rows)
+        setFailureSummary(
+            total > 0
+                ? {
+                    total,
+                    failure_rate_pct:  ((failed / total) * 100).toFixed(1),
+                    delivery_rate_pct: ((sent   / total) * 100).toFixed(1),
+                }
+                : { total: 0, failure_rate_pct: 0, delivery_rate_pct: 0 }
+        )
+    } catch (err) {
+        console.log("Failure analytics ERROR:", err)
+        setFailStats([])
+        setFailureSummary(null)
     }
+}
 
     useEffect(() => {
-        if (activeTab === "analytics") {
-            fetchFailureAnalytics()
-        }
+                if (activeTab === "analytics") {
+                    fetchFailureAnalytics()
+                }
     }, [activeTab, clientId, analyticsFromDate, analyticsToDate])
+
 
     const fetchWebhookLogs = async () => {
         try {
@@ -626,13 +880,19 @@ function Home() {
     }
 
     return (
-        <div style={{ display: "flex", height: "100vh" }}>
+        <div style={{ display: "flex", minHeight: "100vh", alignItems: "flex-start" }}>
             {/* -------- SIDEBAR -------- */}
             <div style={{
                 width: "220px",
+                minWidth: "220px",
                 background: "#1e293b",
                 color: "white",
-                padding: "20px"
+                padding: "20px",
+                position: "sticky",
+                top: 0,
+                height: "100vh",
+                overflowY: "auto",
+                boxSizing: "border-box",
             }}>
             <h3
                 style={{ cursor: "pointer" }}
@@ -644,10 +904,6 @@ function Home() {
                 Queue Stats
             </div>
 
-            <div className={`sidebar-item ${activeTab === "control" ? "active" : ""}`} onClick={() => handleTabChange("control")}>
-                Queue Control
-            </div>
-
             <div className={`sidebar-item ${activeTab === "dlq" ? "active" : ""}`} onClick={() => handleTabChange("dlq")}>
                 Dead Letter Queue
             </div>
@@ -656,21 +912,9 @@ function Home() {
                 My Tokens
             </div>
 
-            <div className={`sidebar-item ${activeTab === "jobs" ? "active" : ""}`} onClick={() => handleTabChange("jobs")}>
-                Job Explorer
+            <div className={`sidebar-item ${activeTab === "activity" ? "active" : ""}`} onClick={() => handleTabChange("activity")}>
+                Jobs + Activity
             </div>
-
-            <button
-                type="button"
-                className={`sidebar-item ${activeTab === "logs" ? "active" : ""}`}
-                onClick={() => {
-                    handleTabChange("logs")
-                    fetchLogs()
-                }}
-                style={{ width: "100%", textAlign: "left", border: "none", color: "inherit", background: "transparent" }}
-            >
-                Logs / Activity
-            </button>
 
             <div className={`sidebar-item ${activeTab === "rate" ? "active" : ""}`} onClick={() => handleTabChange("rate")}>
                 Rate Limits
@@ -694,6 +938,10 @@ function Home() {
 
             <div className={`sidebar-item ${activeTab === "clients" ? "active" : ""}`} onClick={() => handleTabChange("clients")} >
                 Client Monitor
+            </div>
+            
+            <div className={`sidebar-item ${activeTab === "providers" ? "active" : ""}`} onClick={() => handleTabChange("providers")}>
+                Provider Settings
             </div>
 
             <button onClick={handleLogout} style={{ marginTop: "20px" }}>
@@ -729,16 +977,50 @@ function Home() {
                         }}>{clientId || "—"}</span>
                         {clientId && (
                             <button
-                                onClick={() => copyToClipboard(clientId)}
+                                onClick={() => copyToClipboard(clientId, "home-client-id")}
                                 style={{
                                     background: "none", border: "1px solid #475569",
                                     color: "#94a3b8", borderRadius: "5px",
                                     padding: "2px 10px", fontSize: "12px", cursor: "pointer"
                                 }}
                             >
-                                {copied ? "✓" : "Copy"}
+                                {copiedTarget === "home-client-id" ? "✓" : "Copy"}
                             </button>
                         )}
+                    </div>
+
+                    <div style={{
+                        background: "#fff1f2",
+                        border: "1px solid #fecdd3",
+                        borderRadius: "10px",
+                        padding: "16px 20px",
+                        marginBottom: "24px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "14px",
+                        flexWrap: "wrap",
+                    }}>
+                        <div>
+                            <div style={{ color: "#9f1239", fontWeight: 700, marginBottom: "4px" }}>Danger Zone</div>
+                            <div style={{ color: "#881337", fontSize: "14px" }}>
+                                Delete your admin account and remove its related data from this service.
+                            </div>
+                        </div>
+                        <button
+                            onClick={deleteMyAccount}
+                            style={{
+                                background: "#be123c",
+                                color: "#fff",
+                                border: "none",
+                                borderRadius: "8px",
+                                padding: "10px 14px",
+                                fontWeight: 700,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Delete My Account
+                        </button>
                     </div>
 
                     {/* ── Generate API Key Card ── */}
@@ -812,9 +1094,9 @@ function Home() {
                                 }}
                             />
                             <button
-                                onClick={() => copyToClipboard(newApiKey)}
+                                onClick={() => copyToClipboard(newApiKey, "home-api-key")}
                                 style={{
-                                    background: copied ? "#166534" : "#15803d",
+                                    background: copiedTarget === "home-api-key" ? "#166534" : "#15803d",
                                     color: "white",
                                     border: "none",
                                     borderRadius: "7px",
@@ -825,7 +1107,7 @@ function Home() {
                                     transition: "background 0.2s"
                                 }}
                             >
-                                {copied ? "✓ Copied" : "Copy"}
+                                {copiedTarget === "home-api-key" ? "✓ Copied" : "Copy"}
                             </button>
                         </div>
 
@@ -857,12 +1139,15 @@ function Home() {
         )}
 
         {/* -------- MAIN CONTENT -------- */}
-        <div style={{ flex: 1, padding: "20px" }}>
+        <div style={{ flex: 1, padding: "20px", minWidth: 0, boxSizing: "border-box" }}>
 
             {/* -------- QUEUE STATS -------- */}
             {activeTab === "stats" && (
                 <>
                     <h2>Queue Stats</h2>
+                    <div style={{ marginBottom: "16px" }}>
+                        <button className="btn btn-primary" onClick={fetchQueueStats}>Refresh Queue Stats</button>
+                    </div>
 
                     {/* -------- GLOBAL STATS -------- */}
                     <div className="stats-grid">
@@ -894,9 +1179,15 @@ function Home() {
                         <thead>
                             <tr>
                                 <th>Queue</th>
+                                <th>Primary Waiting</th>
+                                <th>Backup Waiting</th>
                                 <th>Waiting</th>
                                 <th>Active</th>
                                 <th>Failed</th>
+                                <th>Active Queue</th>
+                                <th>Dynamic Backup</th>
+                                <th>Status</th>
+                                <th>Action</th>
                             </tr>
                         </thead>
 
@@ -905,62 +1196,169 @@ function Home() {
                                 <tr key={i}>
                                     <td>{q.type}</td>
                                     <td>{q.waiting}</td>
+                                    <td>{Number(q.backup_waiting || 0)}</td>
+                                    <td>{Number(q.waiting || 0) + Number(q.backup_waiting || 0)}</td>
                                     <td>{q.active}</td>
                                     <td>{q.failed}</td>
+                                    <td style={{ maxWidth: "220px", wordBreak: "break-word" }}>{q.active_queue || "-"}</td>
+                                    <td style={{ maxWidth: "220px", wordBreak: "break-word" }}>{q.backup_queue || "Not created"}</td>
+                                    <td>{renderFailoverReasons(q.failover_reasons)}</td>
+                                    <td>
+                                        <button
+                                            type="button"
+                                            className="btn btn-primary"
+                                            onClick={() => openQueueControl(q.type)}
+                                        >
+                                            View
+                                        </button>
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>
                     </table>
-                </>
-            )}
-
-            {activeTab === "control" && (
-                <div className="control-container">
-                    
-                    {/* -------- QUEUE CONTROL -------- */}
-                    <h2>Queue Control</h2>
-
-                    {/* Queue Selector */}
-                    <div className="form-group">
-                        <label>Select Queue</label>
-                        <select
-                            value={selectedQueue}
-                            onChange={(e) => setSelectedQueue(e.target.value)}
-                            className="form-control"
+                    {/* Queue Control Modal — rendered as fixed overlay, scoped to clicked channel */}
+                    {queueControlChannel && (
+                        <div
+                            style={{
+                                position: "fixed",
+                                inset: 0,
+                                background: "rgba(0,0,0,0.35)",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                zIndex: 1000,
+                                padding: "16px",
+                            }}
+                            onClick={(e) => {
+                                // Close on backdrop click
+                                if (e.target === e.currentTarget) {
+                                    setQueueControlChannel(null)
+                                    setShowQueueControl(false)
+                                }
+                            }}
                         >
-                            <option value="EMAIL">EMAIL</option>
-                            <option value="WHATSAPP">WHATSAPP</option>
-                            <option value="SMS">SMS</option>
-                        </select>
-                    </div>
+                            <div
+                                className="control-container"
+                                style={{
+                                    width: "100%",
+                                    maxWidth: "520px",
+                                    maxHeight: "90vh",
+                                    overflowY: "auto",
+                                    background: "#fff",
+                                    borderRadius: "12px",
+                                    padding: "24px",
+                                    boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
+                                }}
+                            >
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", flexWrap: "wrap", marginBottom: "16px" }}>
+                                    <h2 style={{ marginBottom: 0 }}>Queue Control — {queueControlChannel}</h2>
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary"
+                                        onClick={() => {
+                                            setQueueControlChannel(null)
+                                            setShowQueueControl(false)
+                                        }}
+                                    >
+                                        Close
+                                    </button>
+                                </div>
+                                <div style={{ margin: "0 0 16px" }}>
+                                    <button className="btn btn-primary" onClick={fetchQueueStats}>Refresh Queue Status</button>
+                                </div>
 
-                    {/* Buttons */}
-                    <div className="control-buttons">
-                        <button className="btn btn-warning" onClick={pauseQueue}>Pause</button>
-                        <button className="btn btn-success" onClick={resumeQueue}>Resume</button>
-                        <button className="btn btn-danger" onClick={clearQueue}>Clear Queue</button>
-                    </div>
+                                <div
+                                    style={{
+                                        border: "1px solid #dbe2ea",
+                                        borderRadius: "10px",
+                                        padding: "16px",
+                                        marginBottom: "18px",
+                                        background: "#f8fafc"
+                                    }}
+                                >
+                                    <h4 style={{ marginTop: 0, marginBottom: "12px" }}>Failover Status</h4>
+                                    <div style={{
+                                        display: "grid",
+                                        gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+                                        gap: "12px"
+                                    }}>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Primary Queue</div>
+                                            <div style={{ fontWeight: 600, wordBreak: "break-word" }}>
+                                                {selectedQueueStats?.primary_queue || `${queueControlChannel.toLowerCase()}-notify-q`}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Active Queue</div>
+                                            <div style={{ fontWeight: 600, wordBreak: "break-word" }}>
+                                                {selectedQueueStats?.active_queue || "-"}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Dynamic Backup Queue</div>
+                                            <div style={{ fontWeight: 600, wordBreak: "break-word" }}>
+                                                {selectedQueueStats?.backup_queue || "Not created"}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Current State</div>
+                                            <div style={{ fontWeight: 600 }}>
+                                                {renderFailoverReasons(selectedQueueStats?.failover_reasons)}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Primary Waiting</div>
+                                            <div style={{ fontWeight: 600 }}>{selectedQueueStats?.waiting ?? 0}</div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Backup Waiting</div>
+                                            <div style={{ fontWeight: 600 }}>{selectedQueueStats?.backup_waiting ?? 0}</div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Last Failover Reason</div>
+                                            <div style={{ fontWeight: 600 }}>
+                                                {selectedQueueStats?.last_failover_reason || "None"}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>Last Failover Time</div>
+                                            <div style={{ fontWeight: 600 }}>
+                                                {formatDateTime(selectedQueueStats?.last_failover_at)}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
 
-                    <div className="control-buttons">
-                        <button className="btn btn-primary">Retry Failed</button>
-                        <button className="btn btn-secondary">Reprocess DLQ</button>
-                    </div>
+                                <div className="control-buttons">
+                                    <button className="btn btn-warning" onClick={pauseQueue}>Pause</button>
+                                    <button className="btn btn-success" onClick={resumeQueue}>Resume</button>
+                                    <button className="btn btn-danger" onClick={clearQueue}>Clear Queue</button>
+                                </div>
 
-                    {/* Rate Limit */}
-                    <div className="rate-limit-box">
-                        <label>Rate Limit (jobs/sec)</label>
+                                <div className="control-buttons">
+                                    <button className="btn btn-primary" onClick={retryFailed}>Retry Failed</button>
+                                    <button className="btn btn-secondary" onClick={reprocessDLQ}>Reprocess DLQ</button>
+                                </div>
 
-                        <div className="rate-input-group">
-                            <input
-                                type="number"
-                                value={rateLimit}
-                                onChange={(e) => setRateLimit(e.target.value)}
-                                className="form-control"
-                            />
-                            <button className="btn btn-update" onClick={updateRateLimit}>Update</button>
+                                <div className="rate-limit-box">
+                                    <label>Rate Limit (jobs/min)</label>
+                                    <div className="rate-input-group">
+                                        <input
+                                            type="number"
+                                            value={rateLimitDraft}
+                                            onChange={(e) => {
+                                                setRateLimitDraft(e.target.value)
+                                                setRateLimitTouched(true)
+                                            }}
+                                            className="form-control"
+                                        />
+                                        <button className="btn btn-update" onClick={updateRateLimit}>Update</button>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                    </div>
-                </div>
+                    )}
+                </>
             )}
 
             {/* -------- DLQ -------- */}
@@ -977,7 +1375,25 @@ function Home() {
                             <option value="">All</option>
                             <option value="EMAIL">EMAIL</option>
                             <option value="SMS">SMS</option>
+                            <option value="WHATSAPP">WHATSAPP</option>
+                            <option value="PUSH">PUSH</option>
                         </select>
+                        <button
+                            type="button"
+                            onClick={discardAllDlq}
+                            style={{
+                                marginLeft: "8px",
+                                background: "#dc2626",
+                                color: "#fff",
+                                border: "none",
+                                borderRadius: "6px",
+                                padding: "8px 12px",
+                                fontWeight: 600,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Discard All
+                        </button>
                     </div>
 
                     <table border="1" cellPadding="10">
@@ -1021,14 +1437,12 @@ function Home() {
                                         <td>{job.retry_count}</td>
                                         <td>
                                             {job.failed_at
-                                                ? new Date(job.failed_at).toLocaleString()
+                                                ? formatUtcTimestamp(job.failed_at)
                                                 : "-"}
                                         </td>
                                         <td>
-                                            {/* Retry only for transient */}
                                             <button
                                                 onClick={() => retryJob(job.job_id)}
-                                                disabled={job.error_type !== "TRANSIENT"}
                                             >
                                                 Retry
                                             </button>
@@ -1086,10 +1500,10 @@ function Home() {
                         </span>
                         {clientId && (
                             <button
-                                onClick={() => copyToClipboard(clientId)}
+                                onClick={() => copyToClipboard(clientId, "tokens-client-id")}
                                 style={{ background: "#334155", color: "#fff" }}
                             >
-                                Copy
+                                {copiedTarget === "tokens-client-id" ? "✓" : "Copy"}
                             </button>
                         )}
                     </div>
@@ -1107,7 +1521,6 @@ function Home() {
                         <thead>
                             <tr>
                                 <th>Event Type</th>
-                                <th>API Key</th>
                                 <th>Status</th>
                                 <th>Actions</th>
                             </tr>
@@ -1117,10 +1530,6 @@ function Home() {
                             {tokens.map((t, i) => (
                                 <tr key={i}>
                                     <td>{t.event_type}</td>
-                                    <td style={{ fontFamily: "monospace", maxWidth: "340px", wordBreak: "break-all" }}>
-                                        {tokenApiKeys[t.event_type] || "Not available (shown only when generated/refreshed)"}
-                                    </td>
-
                                     <td>
                                         <span
                                             style={{
@@ -1163,129 +1572,217 @@ function Home() {
                 </>
             )}
             
-            {/* -------- JOB EXPLORER -----------*/ }
-            {activeTab === "jobs" && (
-                <>
-                    <h2>Job Explorer</h2>
+            {/* -------- JOBS + ACTIVITY (MERGED) -----------*/ }
+            {activeTab === "activity" && (() => {
+                // ------ Start from jobs, then enrich with logs ------
+                // /jobs returns server-side per-recipient outcome counts, which avoids
+                // undercounting when /logs is paginated during large load tests.
+                const collapsed = {}
+                for (const job of jobs) {
+                    const jid = job.job_id || "__no_id__"
+                    const succeededUserIds = Array.isArray(job.succeeded_user_ids) ? job.succeeded_user_ids : []
+                    const failedUserIds = Array.isArray(job.failed_user_ids) ? job.failed_user_ids : []
+                    const userIds = new Set(Array.isArray(job.user_ids) ? job.user_ids : [])
+                    for (const u of succeededUserIds) userIds.add(u)
+                    for (const u of failedUserIds) userIds.add(u)
 
-                    {/* 🔽 Channel Filter */}
-                    <div className="job-filter">
-                        <label>Filter by Channel:</label>
-                        <select
-                            value={search}
-                            onChange={(e) => setSearch(e.target.value)}
-                        >
-                            <option value="">All</option>
-                            <option value="EMAIL">EMAIL</option>
-                            <option value="SMS">SMS</option>
-                            <option value="PUSH">PUSH</option>
-                            <option value="WHATSAPP">WHATSAPP</option>
-                        </select>
-                    </div>
+                    collapsed[jid] = {
+                        job_id:             jid,
+                        client_id:          job.client_id || "-",
+                        event_type:         job.event_type || "-",
+                        channel:            job.channel || "-",
+                        user_ids:           userIds,
+                        recipientOutcomes:  {},
+                        succeeded_user_ids: succeededUserIds,
+                        failed_user_ids:    failedUserIds,
+                        job_created_at:     job.created_at || null,
+                        log_status:         job.latest_log_status || job.status || "-",
+                        log_time:           job.latest_log_time || job.updated_at || null,
+                        error:              job.latest_error || null,
+                        _latestMs:          new Date(job.latest_log_time || job.updated_at || job.created_at || 0).getTime(),
+                    }
+                }
 
-                    {/* 📋 Job Table */}
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Job ID</th>
-                                <th>Event</th>
-                                <th>Channel</th>
-                                <th>Status</th>
-                                <th>Created At</th>
-                            </tr>
-                        </thead>
+                for (const log of logs) {
+                    const jid = log.job_id || "__no_id__"
+                    const job = collapsed[jid] || log.job || {}
 
-                        <tbody>
-                            {jobs
-                                .filter(j => !search || String(j.channel || "").toUpperCase() === search)
-                                .map(job => (
-                                    <tr key={job.job_id}>
-                                        <td>{job.job_id}</td>
-                                        <td>{job.event_type}</td>
-                                        <td>{job.channel}</td>
+                    if (!collapsed[jid]) {
+                        collapsed[jid] = {
+                            job_id:          jid,
+                            client_id:       job.client_id  || log.client_id  || "-",
+                            event_type:      job.event_type || log.event_type || "-",
+                            channel:         job.channel    || log.channel    || "-",
+                            user_ids:        new Set(Array.isArray(job.user_ids) ? job.user_ids : []),
+                            recipientOutcomes: {},
+                            succeeded_user_ids: [],
+                            failed_user_ids: [],
+                            job_created_at:  job.created_at || null,
+                            // latest-log fields (updated below if a newer log comes)
+                            log_status:      log.status || "-",
+                            log_time:        log.created_at || null,
+                            error:           log.error || null,
+                            _latestMs:       new Date(log.created_at || 0).getTime(),
+                        }
+                    } else {
+                        const ms = new Date(log.created_at || 0).getTime()
+                        if (ms > collapsed[jid]._latestMs) {
+                            collapsed[jid].log_status = log.status || "-"
+                            collapsed[jid].log_time   = log.created_at || null
+                            collapsed[jid].error      = log.error || null
+                            collapsed[jid]._latestMs  = ms
+                        }
+                    }
+
+                    if (Array.isArray(job.user_ids)) {
+                        for (const u of job.user_ids) collapsed[jid].user_ids.add(u)
+                    }
+
+                    const recipientUserId = log.recipient_user_id || log.job?.recipient_user_id
+                    if (recipientUserId) {
+                        collapsed[jid].user_ids.add(recipientUserId)
+                        const priorOutcome = collapsed[jid].recipientOutcomes[recipientUserId]
+                        const currentMs = new Date(log.created_at || 0).getTime()
+                        if (!priorOutcome || currentMs >= priorOutcome.ms) {
+                            collapsed[jid].recipientOutcomes[recipientUserId] = {
+                                status: String(log.status || "").toUpperCase(),
+                                ms: currentMs,
+                            }
+                        }
+                    }
+                }
+
+                // Convert map → array, resolve Set → array, sort newest job first
+                const merged = Object.values(collapsed).map((row) => ({
+                    ...row,
+                    user_ids: [...row.user_ids],
+                    succeeded_user_ids: row.succeeded_user_ids.length
+                        ? row.succeeded_user_ids
+                        : Object.entries(row.recipientOutcomes)
+                        .filter(([, outcome]) => SUCCESS_ACTIVITY_STATUSES.has(outcome.status))
+                        .map(([userId]) => userId),
+                    failed_user_ids: row.failed_user_ids.length
+                        ? row.failed_user_ids
+                        : Object.entries(row.recipientOutcomes)
+                        .filter(([, outcome]) => FAILED_ACTIVITY_STATUSES.has(outcome.status))
+                        .map(([userId]) => userId),
+                })).sort((a, b) =>
+                    new Date(b.job_created_at || 0).getTime() - new Date(a.job_created_at || 0).getTime()
+                )
+
+                const filtered = merged.filter((row) => {
+                    const jidOk = !filterJobId     || row.job_id.toLowerCase().includes(filterJobId.toLowerCase())
+                    const chOk  = !filterChannel2  || row.channel.toLowerCase() === filterChannel2.toLowerCase()
+                    const evOk  = !filterEventType2|| row.event_type.toLowerCase().includes(filterEventType2.toLowerCase())
+                    const cidOk = !filterClientId2 || row.client_id.toLowerCase().includes(filterClientId2.toLowerCase())
+                    const stOk  = !filterStatus2   || row.log_status.toUpperCase() === filterStatus2.toUpperCase()
+                    return jidOk && chOk && evOk && cidOk && stOk
+                })
+
+                return (
+                    <>
+                        <h2>Jobs + Activity</h2>
+
+                        <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
+                            <input
+                                type="text"
+                                placeholder="Filter by job_id"
+                                value={filterJobId}
+                                onChange={(e) => setFilterJobId(e.target.value)}
+                                style={{ width: "200px", maxWidth: "100%" }}
+                            />
+                            <select value={filterChannel2} onChange={(e) => setFilterChannel2(e.target.value)}>
+                                <option value="">All Channels</option>
+                                <option value="email">email</option>
+                                <option value="sms">sms</option>
+                                <option value="whatsapp">whatsapp</option>
+                                <option value="push">push</option>
+                            </select>
+                            <input
+                                type="text"
+                                placeholder="Filter by event_type"
+                                value={filterEventType2}
+                                onChange={(e) => setFilterEventType2(e.target.value)}
+                                style={{ width: "200px", maxWidth: "100%" }}
+                            />
+                            <input
+                                type="text"
+                                placeholder="Filter by client_id"
+                                value={filterClientId2}
+                                onChange={(e) => setFilterClientId2(e.target.value)}
+                                style={{ width: "200px", maxWidth: "100%" }}
+                            />
+                            <select value={filterStatus2} onChange={(e) => setFilterStatus2(e.target.value)}>
+                                <option value="">All Statuses</option>
+                                <option value="QUEUED">QUEUED</option>
+                                <option value="PROCESSING">PROCESSING</option>
+                                <option value="SENT">SENT</option>
+                                <option value="DELIVERED">DELIVERED</option>
+                                <option value="READ">READ</option>
+                                <option value="DLQ">DLQ</option>
+                                <option value="FAILED">FAILED</option>
+                                <option value="DROPPED">DROPPED</option>
+                            </select>
+                        </div>
+
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Job ID</th>
+                                    <th>Client ID</th>
+                                    <th>Event</th>
+                                    <th>Channel</th>
+                                    <th>Status</th>
+                                    <th>Succeeded Tasks</th>
+                                    <th>Failed Tasks</th>
+                                    <th>Job Creation Time</th>
+                                    <th>Log Receiving Time</th>
+                                    <th>Error</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {filtered.map((row) => (
+                                    <tr key={row.job_id}>
                                         <td>
-                                            <span className={`status ${job.status?.toLowerCase()}`}>
-                                                {job.status}
-                                            </span>
+                                            {renderActivityLink(row.job_id, () =>
+                                                openActivityDetail(
+                                                    `All attempted user IDs for ${row.job_id}`,
+                                                    row.user_ids,
+                                                    "No user IDs were found for this job."
+                                                )
+                                            )}
+                                        </td>
+                                        <td>{row.client_id}</td>
+                                        <td>{row.event_type}</td>
+                                        <td>{row.channel}</td>
+                                        <td>{row.log_status}</td>
+                                        <td>
+                                            {renderActivityLink(String(row.succeeded_user_ids.length), () =>
+                                                openActivityDetail(
+                                                    `Succeeded user IDs for ${row.job_id}`,
+                                                    row.succeeded_user_ids,
+                                                    "No successful recipients were found for this job."
+                                                )
+                                            )}
                                         </td>
                                         <td>
-                                            {job.created_at
-                                                ? new Date(job.created_at).toLocaleString()
-                                                : "-"}
+                                            {renderActivityLink(String(row.failed_user_ids.length), () =>
+                                                openActivityDetail(
+                                                    `Failed user IDs for ${row.job_id}`,
+                                                    row.failed_user_ids,
+                                                    "No failed recipients were found for this job."
+                                                )
+                                            )}
                                         </td>
+                                        <td>{row.job_created_at ? formatAdminTimestamp(row.job_created_at, "Z") : "-"}</td>
+                                        <td>{row.log_time ? formatUtcTimestamp(row.log_time) : "-"}</td>                                        <td>{toDisplayText(row.error)}</td>
                                     </tr>
                                 ))}
-                        </tbody>
-                    </table>
-                </>
-            )}
-
-            {/* ----------------- LOGS / ACTIVITY ------------------*/}
-            {activeTab === "logs" && (
-                <>
-                    <h2>Logs / Activity</h2>
-                    <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
-                        <select value={logFilter} onChange={(e) => setLogFilter(e.target.value)}>
-                            <option value="ALL">All Statuses</option>
-                            <option value="SENT">SENT</option>
-                            <option value="DELIVERED">DELIVERED</option>
-                            <option value="READ">READ</option>
-                            <option value="FAILED">FAILED</option>
-                            <option value="SPAM">SPAM</option>
-                            <option value="DLQ">DLQ</option>
-                        </select>
-                        <input
-                            type="text"
-                            placeholder="Search by job id / event type / client id"
-                            value={logSearch}
-                            onChange={(e) => setLogSearch(e.target.value)}
-                            style={{ width: "360px", maxWidth: "100%" }}
-                        />
-                    </div>
-                    {/* 📋 Logs Table */}
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Time</th>
-                                <th>Event</th>
-                                <th>Status</th>
-                                <th>Channel</th>
-                                <th>Client ID</th>
-                                <th>User ID</th>
-                                <th>Job ID</th>
-                                <th>Error</th>
-                            </tr>
-                        </thead>
-
-                        <tbody>
-                            {logs
-                                .filter(log =>
-                                    (logFilter === "ALL" || log.status === logFilter) &&
-                                    `${log.job_id || ""} ${log.event_type || ""} ${log?.job?.client_id || ""}`
-                                        .toLowerCase()
-                                        .includes(logSearch.toLowerCase())
-                                )
-                                .map((log, i) => (
-                                    <tr key={i}>
-                                        <td>
-                                            {log.created_at
-                                                ? new Date(log.created_at).toLocaleString()
-                                                : "-"}
-                                        </td>
-
-                                        <td>{log.event_type || "-"}</td>
-                                        <td>{log.status || "-"}</td>
-                                        <td>{log.channel || "-"}</td>
-                                        <td>{log?.job?.client_id || "-"}</td>
-                                        <td>{log?.job?.recipient_user_id || "-"}</td>
-                                        <td>{log.job_id || "-"}</td>
-                                        <td>{toDisplayText(log.error)}</td>
-                                    </tr>
-                                ))}
-                        </tbody>
-                    </table>
-                </>
-            )}
+                            </tbody>
+                        </table>
+                    </>
+                )
+            })()}
 
             {/*---------------------------------- RATE LIMITS -----------------------------------*/}
             {activeTab === "rate" && (
@@ -1417,7 +1914,6 @@ function Home() {
                             <option value="DELIVERED">DELIVERED</option>
                             <option value="READ">READ</option>
                             <option value="FAILED">FAILED</option>
-                            <option value="SPAM">SPAM</option>
                         </select>
                     </div>
                     <table>
@@ -1429,6 +1925,8 @@ function Home() {
                                 <th>Provider</th>
                                 <th>Provider Message ID</th>
                                 <th>Created At</th>
+                                <th>Delivered At</th>
+                                <th>Read At</th>
                                 <th>Error</th>
                             </tr>
                         </thead>
@@ -1440,7 +1938,9 @@ function Home() {
                                     <td>{w.status}</td>
                                     <td>{w.provider || "-"}</td>
                                     <td>{w.provider_message_id || "-"}</td>
-                                    <td>{w.created_at ? new Date(w.created_at).toLocaleString() : "-"}</td>
+                                    <td>{w.created_at ? formatAdminTimestamp(w.created_at, "+05:30") : "-"}</td>
+                                    <td>{w.delivered_at ? formatAdminTimestamp(w.delivered_at, "+05:30") : "-"}</td>
+                                    <td>{w.read_at ? formatAdminTimestamp(w.read_at, "+05:30") : "-"}</td>
                                     <td>{toDisplayText(w.error)}</td>
                                 </tr>
                             ))}
@@ -1450,98 +1950,353 @@ function Home() {
             )}
 
             {activeTab === "clients" && (
-                <>
-                    <h2>Client Monitor</h2>
-                    <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
-                        <input
-                            type="text"
-                            placeholder="Search by client id or name"
-                            value={clientSearch}
-                            onChange={(e) => setClientSearch(e.target.value)}
-                            style={{ width: "280px", maxWidth: "100%" }}
-                        />
-                        <select
-                            value={clientStatusFilter}
-                            onChange={(e) => setClientStatusFilter(e.target.value)}
-                        >
-                            <option value="all">All</option>
-                            <option value="active">Active</option>
-                            <option value="inactive">Inactive</option>
-                        </select>
-                        <button onClick={fetchClients}>Refresh</button>
-                    </div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Client ID</th>
-                                <th>Name</th>
-                                <th>Status</th>
-                                <th>Monthly Quota</th>
-                                <th>Allowed Channels</th>
-                                <th>Created At</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {clients
-                                .filter((c) => {
-                                    const byStatus =
-                                        clientStatusFilter === "all" ||
-                                        (clientStatusFilter === "active" && c.is_active) ||
-                                        (clientStatusFilter === "inactive" && !c.is_active)
-                                    const q = clientSearch.trim().toLowerCase()
-                                    const bySearch =
-                                        !q ||
-                                        String(c.client_id || "").toLowerCase().includes(q) ||
-                                        String(c.name || "").toLowerCase().includes(q)
-                                    return byStatus && bySearch
-                                })
-                                .map((c) => (
-                                    <tr key={c.client_id}>
-                                        <td>{c.client_id}</td>
-                                        <td>{c.name || "-"}</td>
+            <>
+                <h2>Client Monitor</h2>
+                <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap", alignItems: "center" }}>
+                    <input
+                        type="text"
+                        placeholder="Search by client id or name"
+                        value={clientSearch}
+                        onChange={(e) => setClientSearch(e.target.value)}
+                        style={{ width: "280px", maxWidth: "100%" }}
+                    />
+                    <select value={clientStatusFilter} onChange={(e) => setClientStatusFilter(e.target.value)}>
+                        <option value="all">All</option>
+                        <option value="active">Active</option>
+                        <option value="inactive">Inactive</option>
+                    </select>
+
+                    {/* Select button — toggles checkbox mode */}
+                    <button
+                        onClick={() => {
+                            setClientSelectMode(m => !m)
+                            setSelectedClients(new Set())
+                        }}
+                        style={{
+                            background: clientSelectMode ? "#1d4ed8" : "#e2e8f0",
+                            color: clientSelectMode ? "#fff" : "#374151",
+                            border: "none", borderRadius: "6px",
+                            padding: "8px 14px", fontWeight: 600, cursor: "pointer"
+                        }}
+                    >
+                        {clientSelectMode ? "Cancel Select" : "Select"}
+                    </button>
+
+                    {/* Bulk action bar — only shown when in select mode and something is selected */}
+                    {clientSelectMode && selectedClients.size > 0 && (
+                        <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#fef3c7", border: "1px solid #f59e0b", borderRadius: "6px", padding: "6px 12px" }}>
+                            <span style={{ fontSize: "13px", fontWeight: 600, color: "#92400e" }}>
+                                {selectedClients.size} selected
+                            </span>
+                            <button
+                                onClick={deleteSelectedClients}
+                                style={{ background: "#dc2626", color: "#fff", border: "none", borderRadius: "6px", padding: "6px 12px", fontWeight: 600, cursor: "pointer", fontSize: "13px" }}
+                            >
+                                Delete Selected
+                            </button>
+                            <button
+                                onClick={() => setSelectedClients(new Set())}
+                                style={{ background: "transparent", color: "#92400e", border: "1px solid #f59e0b", borderRadius: "6px", padding: "6px 10px", cursor: "pointer", fontSize: "13px" }}
+                            >
+                                Clear
+                            </button>
+                        </div>
+                    )}
+
+                    <button
+                        onClick={deleteAllClientAccounts}
+                        style={{ background: "#991b1b", color: "#fff", border: "none", borderRadius: "6px", padding: "8px 12px", fontWeight: 700, cursor: "pointer" }}
+                    >
+                        Delete All Accounts
+                    </button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            {clientSelectMode && (
+                                <th>
+                                    <input
+                                        type="checkbox"
+                                        title="Select all visible"
+                                        onChange={(e) => {
+                                            const visible = clients.filter((c) => {
+                                                const byStatus = clientStatusFilter === "all" || (clientStatusFilter === "active" && c.is_active) || (clientStatusFilter === "inactive" && !c.is_active)
+                                                const q = clientSearch.trim().toLowerCase()
+                                                const bySearch = !q || String(c.client_id || "").toLowerCase().includes(q) || String(c.name || "").toLowerCase().includes(q)
+                                                return byStatus && bySearch
+                                            })
+                                            if (e.target.checked) setSelectedClients(new Set(visible.map(c => c.client_id)))
+                                            else setSelectedClients(new Set())
+                                        }}
+                                        checked={(() => {
+                                            const visible = clients.filter((c) => {
+                                                const byStatus = clientStatusFilter === "all" || (clientStatusFilter === "active" && c.is_active) || (clientStatusFilter === "inactive" && !c.is_active)
+                                                const q = clientSearch.trim().toLowerCase()
+                                                const bySearch = !q || String(c.client_id || "").toLowerCase().includes(q) || String(c.name || "").toLowerCase().includes(q)
+                                                return byStatus && bySearch
+                                            })
+                                            return visible.length > 0 && visible.every(c => selectedClients.has(c.client_id))
+                                        })()}
+                                    />
+                                </th>
+                            )}
+                            <th>Client ID</th>
+                            <th>Name</th>
+                            <th>Status</th>
+                            <th>Monthly Quota</th>
+                            <th>Allowed Channels</th>
+                            <th>Created At</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {clients
+                            .filter((c) => {
+                                const byStatus = clientStatusFilter === "all" || (clientStatusFilter === "active" && c.is_active) || (clientStatusFilter === "inactive" && !c.is_active)
+                                const q = clientSearch.trim().toLowerCase()
+                                const bySearch = !q || String(c.client_id || "").toLowerCase().includes(q) || String(c.name || "").toLowerCase().includes(q)
+                                return byStatus && bySearch
+                            })
+                            .map((c) => (
+                                <tr key={c.client_id} style={{ background: selectedClients.has(c.client_id) ? "#eff6ff" : undefined }}>
+                                    {clientSelectMode && (
                                         <td>
-                                            <span style={{ color: c.is_active ? "green" : "red", fontWeight: "bold" }}>
-                                                {c.is_active ? "Active" : "Inactive"}
-                                            </span>
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedClients.has(c.client_id)}
+                                                onChange={(e) => {
+                                                    const next = new Set(selectedClients)
+                                                    if (e.target.checked) next.add(c.client_id)
+                                                    else next.delete(c.client_id)
+                                                    setSelectedClients(next)
+                                                }}
+                                            />
                                         </td>
-                                        <td>
-                                            <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                                                <input
-                                                    type="number"
-                                                    min="1"
-                                                    value={quotaDrafts[c.client_id] ?? c.monthly_quota ?? ""}
-                                                    onChange={(e) =>
-                                                        setQuotaDrafts((prev) => ({
-                                                            ...prev,
-                                                            [c.client_id]: e.target.value,
-                                                        }))
-                                                    }
-                                                    style={{ width: "110px" }}
-                                                />
-                                                <button onClick={() => updateClientQuota(c)}>Save</button>
-                                            </div>
-                                        </td>
-                                        <td>{(c.allowed_channels || []).join(", ") || "-"}</td>
-                                        <td>{c.created_at ? new Date(c.created_at).toLocaleString() : "-"}</td>
-                                        <td>
+                                    )}
+                                    <td>{c.client_id}</td>
+                                    <td>{c.name || "-"}</td>
+                                    <td>
+                                        <span style={{ color: c.is_active ? "green" : "red", fontWeight: "bold" }}>
+                                            {c.is_active ? "Active" : "Inactive"}
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                value={quotaDrafts[c.client_id] ?? c.monthly_quota ?? ""}
+                                                onChange={(e) => setQuotaDrafts((prev) => ({ ...prev, [c.client_id]: e.target.value }))}
+                                                style={{ width: "110px" }}
+                                            />
+                                            <button onClick={() => updateClientQuota(c)}>Save</button>
+                                        </div>
+                                    </td>
+                                    <td>{(c.allowed_channels || []).join(", ") || "-"}</td>
+                                    <td>{c.created_at ? new Date(c.created_at).toLocaleString() : "-"}</td>
+                                    <td>
+                                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
                                             <button onClick={() => toggleClientActive(c)}>
                                                 {c.is_active ? "Deactivate" : "Activate"}
                                             </button>
+                                            <button onClick={() => rotateClientKey(c)}>Rotate Key</button>
                                             <button
-                                                onClick={() => rotateClientKey(c)}
-                                                style={{ marginLeft: "6px" }}
+                                                onClick={() => deleteClientAccount(c)}
+                                                style={{ background: "#dc2626", color: "#fff", border: "none", borderRadius: "6px", padding: "8px 12px", fontWeight: 600, cursor: "pointer" }}
                                             >
-                                                Rotate Key
+                                                Delete Account
                                             </button>
-                                        </td>
-                                    </tr>
-                                ))}
-                        </tbody>
-                    </table>
-                </>
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                    </tbody>
+                </table>
+            </>
+)}
+
+            {activeTab === "providers" && (
+                <><ProviderSettings /></>
             )}
+
         </div>
+        {activityDetail && (
+            <div
+                style={{
+                    position: "fixed",
+                    inset: 0,
+                    background: "rgba(2, 6, 23, 0.72)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    zIndex: 1100,
+                    padding: "16px",
+                }}
+            >
+                <div
+                    style={{
+                        width: "100%",
+                        maxWidth: "720px",
+                        maxHeight: "80vh",
+                        overflowY: "auto",
+                        background: "#ffffff",
+                        border: "1px solid #dbe2ea",
+                        borderRadius: "10px",
+                        padding: "22px",
+                        boxShadow: "0 12px 36px rgba(15, 23, 42, 0.22)",
+                    }}
+                >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "14px" }}>
+                        <h3 style={{ margin: 0 }}>{activityDetail.title}</h3>
+                        <button
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => setActivityDetail(null)}
+                        >
+                            Close
+                        </button>
+                    </div>
+
+                    {activityDetail.userIds.length ? (
+                        <div
+                            style={{
+                                display: "grid",
+                                gap: "8px",
+                                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                            }}
+                        >
+                            {activityDetail.userIds.map((userId) => (
+                                <div
+                                    key={userId}
+                                    style={{
+                                        border: "1px solid #e2e8f0",
+                                        borderRadius: "8px",
+                                        padding: "10px 12px",
+                                        background: "#f8fafc",
+                                        wordBreak: "break-word",
+                                    }}
+                                >
+                                    {userId}
+                                </div>
+                            ))}
+                        </div>
+                    ) : (
+                        <div style={{ color: "#64748b" }}>{activityDetail.emptyMessage}</div>
+                    )}
+                </div>
+            </div>
+        )}
+
+        {selectedJob && (
+            <div
+                style={{
+                    position: "fixed",
+                    inset: 0,
+                    background: "rgba(2, 6, 23, 0.72)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    zIndex: 1000,
+                    padding: "16px",
+                }}
+                onClick={(e) => {
+                    if (e.target === e.currentTarget) {
+                        setSelectedJob(null)
+                    }
+                }}
+            >
+                <div
+                    style={{
+                        width: "100%",
+                        maxWidth: "760px",
+                        maxHeight: "88vh",
+                        overflowY: "auto",
+                        background: "#ffffff",
+                        border: "1px solid #dbe2ea",
+                        borderRadius: "10px",
+                        padding: "22px",
+                        boxShadow: "0 12px 36px rgba(15, 23, 42, 0.22)",
+                    }}
+                >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "center", marginBottom: "14px" }}>
+                        <h3 style={{ margin: 0 }}>DLQ Job Details</h3>
+                        <button
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => setSelectedJob(null)}
+                        >
+                            Close
+                        </button>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "12px", marginBottom: "16px" }}>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Job ID</div>
+                            <div style={{ fontWeight: 600, wordBreak: "break-word" }}>{selectedJob.job_id || "-"}</div>
+                        </div>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Queue</div>
+                            <div style={{ fontWeight: 600 }}>{selectedJob.queue_name || selectedJob.channel || "-"}</div>
+                        </div>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Status</div>
+                            <div style={{ fontWeight: 600 }}>{selectedJob.status || "-"}</div>
+                        </div>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Failed At</div>
+                            <div style={{ fontWeight: 600 }}>{formatUtcTimestamp(selectedJob.failed_at)}</div>
+                        </div>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Error Type</div>
+                            <div style={{ fontWeight: 600 }}>{selectedJob.error_type || "-"}</div>
+                        </div>
+                        <div>
+                            <div style={{ fontSize: "12px", color: "#64748b" }}>Error Code</div>
+                            <div style={{ fontWeight: 600 }}>{selectedJob.error_code || "-"}</div>
+                        </div>
+                    </div>
+
+                    <div style={{ marginBottom: "16px" }}>
+                        <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "6px" }}>Error Message</div>
+                        <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: "8px", padding: "10px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                            {toDisplayText(selectedJob.error_message)}
+                        </div>
+                    </div>
+
+                    <div style={{ marginBottom: "16px" }}>
+                        <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "6px" }}>Payload</div>
+                        <pre style={{ background: "#0f172a", color: "#e2e8f0", borderRadius: "8px", padding: "12px", overflowX: "auto", fontSize: "12px" }}>
+                            {JSON.stringify(selectedJob.payload || selectedJob.content || {}, null, 2)}
+                        </pre>
+                    </div>
+
+                    <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px", flexWrap: "wrap" }}>
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            onClick={async () => {
+                                if (await retryJob(selectedJob.job_id)) {
+                                    setSelectedJob(null)
+                                }
+                            }}
+                        >
+                            Retry
+                        </button>
+                        <button
+                            type="button"
+                            className="btn btn-danger"
+                            onClick={async () => {
+                                if (await discardJob(selectedJob.job_id)) {
+                                    setSelectedJob(null)
+                                }
+                            }}
+                        >
+                            Discard
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
 
         {tokenModal.open && (
             <div
@@ -1591,10 +2346,10 @@ function Home() {
                     />
                     <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
                         <button
-                            onClick={() => copyToClipboard(tokenModal.apiKey)}
+                            onClick={() => copyToClipboard(tokenModal.apiKey, "token-modal-key")}
                             style={{ background: "#2563eb", color: "#fff" }}
                         >
-                            Copy Key
+                            {copiedTarget === "token-modal-key" ? "✓" : "Copy Key"}
                         </button>
                         <button
                             onClick={() => setTokenModal({ open: false, eventType: "", apiKey: "" })}

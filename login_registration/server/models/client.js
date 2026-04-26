@@ -33,7 +33,7 @@ const ClientSchema = new mongoose.Schema({
 
     monthly_quota: {
         type: Number,
-        default: 1000
+        default: 10000000
     },
 
     quota_used: {
@@ -48,12 +48,12 @@ const ClientSchema = new mongoose.Schema({
 
     per_user_rate_limit: {
         type: Number,
-        default: 5
+        default: 5000
     },
 
     global_rate_limit: {
         type: Number,
-        default: 1000
+        default: 10000000
     },
 
     webhook_url: String,

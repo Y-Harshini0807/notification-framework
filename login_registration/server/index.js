@@ -101,7 +101,7 @@ app.post("/register", async (req, res) => {
                 plain_api_key: rawApiKey,
                 event_type:    "DEFAULT",
                 allowed_channels: ["email", "sms", "whatsapp", "push"],
-                monthly_quota: 100000,
+                monthly_quota: 10000000,
             });
             console.log(`[SYNC] Client ${client_id} synced to FastAPI`);
         } catch (syncErr) {
@@ -226,7 +226,7 @@ app.post("/create-token", authenticate, async (req, res) => {
                 plain_api_key:    rawKey,
                 event_type:       eventType,
                 allowed_channels: ["email", "sms", "whatsapp", "push"],
-                monthly_quota:    user.monthly_quota || 100000,
+                monthly_quota:    user.monthly_quota || 10000000,
             })
             console.log(`[SYNC] create-token → FastAPI for ${user.client_id}`)
         } catch (syncErr) {
@@ -276,7 +276,7 @@ app.post("/refresh-token", authenticate, async (req, res) => {
                 plain_api_key:    rawKey,
                 event_type:       eventType,
                 allowed_channels: ["email", "sms", "whatsapp", "push"],
-                monthly_quota:    user.monthly_quota || 100000,
+                monthly_quota:    user.monthly_quota || 10000000,
             })
             console.log(`[SYNC] refresh-token → FastAPI for ${user.client_id}`)
         } catch (syncErr) {
@@ -376,7 +376,7 @@ app.post("/sync-to-fastapi", authenticate, async (req, res) => {
             plain_api_key:    plain_api_key,
             event_type:       event_type,
             allowed_channels: ["email", "sms", "whatsapp", "push"],
-            monthly_quota:    user.monthly_quota || 100000,
+            monthly_quota:    user.monthly_quota || 10000000,
         });
 
         res.json({ message: "Synced to FastAPI successfully.", client_id: user.client_id });
@@ -412,7 +412,7 @@ app.post("/generate-api-key", authenticate, async (req, res) => {
             plain_api_key:    newRawKey,
             event_type:       "DEFAULT",
             allowed_channels: ["email", "sms", "whatsapp", "push"],
-            monthly_quota:    user.monthly_quota || 100000,
+            monthly_quota:    user.monthly_quota || 10000000,
         });
 
         res.json({
@@ -422,6 +422,60 @@ app.post("/generate-api-key", authenticate, async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ message: "Server error: " + err.message });
+    }
+});
+
+// -------------------- DELETE MY ACCOUNT --------------------
+app.delete("/delete-account", authenticate, async (req, res) => {
+    try {
+        const user = await EmployeeModel.findOne({ email: req.user.email });
+        if (!user) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        const clientId = user.client_id;
+        const db = mongoose.connection.db;
+
+        const mediaDocs = await db
+            .collection("media_files")
+            .find({ client_id: clientId }, { projection: { stored_path: 1 } })
+            .toArray();
+
+        let removedMediaFiles = 0;
+        for (const doc of mediaDocs) {
+            const path = doc?.stored_path;
+            if (!path) continue;
+            try {
+                require("fs").unlinkSync(path);
+                removedMediaFiles += 1;
+            } catch (err) {
+                if (err?.code !== "ENOENT") {
+                    console.warn("[DELETE_ACCOUNT] media file cleanup failed:", err.message);
+                }
+            }
+        }
+
+        const deletedCounts = {
+            api_clients: (await EmployeeModel.deleteOne({ email: req.user.email })).deletedCount,
+            notification_requests: (await db.collection("notification_requests").deleteMany({ client_id: clientId })).deletedCount,
+            notification_jobs: (await db.collection("notification_jobs").deleteMany({ client_id: clientId })).deletedCount,
+            delivery_logs: (await db.collection("delivery_logs").deleteMany({ client_id: clientId })).deletedCount,
+            rate_limit_logs: (await db.collection("rate_limit_logs").deleteMany({ client_id: clientId })).deletedCount,
+            webhook_calls: (await db.collection("webhook_calls").deleteMany({ client_id: clientId })).deletedCount,
+            user_preferences: (await db.collection("user_preferences").deleteMany({ client_id: clientId })).deletedCount,
+            media_files: (await db.collection("media_files").deleteMany({ client_id: clientId })).deletedCount,
+            dlq: (await db.collection("dlq").deleteMany({ client_id: clientId })).deletedCount,
+            media_files_removed_from_disk: removedMediaFiles,
+        };
+
+        return res.json({
+            message: "Your account has been deleted.",
+            client_id: clientId,
+            deleted_counts: deletedCounts,
+        });
+    } catch (err) {
+        console.error("[DELETE_ACCOUNT]", err);
+        return res.status(500).json({ message: "Server error" });
     }
 });
 

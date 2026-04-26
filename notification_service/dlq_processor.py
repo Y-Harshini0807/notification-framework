@@ -28,6 +28,7 @@ db        = client["notification_db"]
 
 dlq_collection  = db["dlq"]
 jobs_collection = db["notification_jobs"]
+queue_controls_collection = db["queue_controls"]
 
 
 # ── CHANNEL → recipient address field mapping ─────────────────────────────────
@@ -74,6 +75,12 @@ def handle_job(job):
         requeue(job)
 
 
+def _active_queue_for_channel(channel: str) -> str:
+    normalized = (channel or "").strip().lower() or "email"
+    control = queue_controls_collection.find_one({"channel": normalized}, {"_id": 0, "active_queue": 1})
+    return (control or {}).get("active_queue") or f"{normalized}-notify-q"
+
+
 def requeue(job, delay=False, switch_provider=False):
     job_id = job["job_id"]
 
@@ -85,7 +92,7 @@ def requeue(job, delay=False, switch_provider=False):
 
     channel            = original.get("channel", "email")
     providers_snapshot = original.get("providers_snapshot", [])
-    queue_name         = original.get("queue_name", f"{channel}-notify-q")
+    queue_name         = _active_queue_for_channel(channel)
 
     # ── Validate providers_snapshot ──────────────────────────────────────────
     if not providers_snapshot:
@@ -159,6 +166,8 @@ def requeue(job, delay=False, switch_provider=False):
         {"job_id": job_id},
         {"$set": {
             "status":     "QUEUED",
+            "queue_name": queue_name,
+            "queue_role": "backup" if "-notify-q-backup" in str(queue_name) else "primary",
             "retry_meta": new_job["retry_meta"],
             "updated_at": datetime.utcnow(),
         }},

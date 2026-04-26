@@ -1,5 +1,5 @@
 from celery import Celery
-from kombu import Queue
+from kombu import Queue, Exchange
 
 celery_app = Celery(
     "tasks",
@@ -10,6 +10,14 @@ celery_app = Celery(
     result_serializer="json",
 )
 
+app = Celery('tasks')
+app.conf.task_queues = (
+    Queue('important', 
+          exchange=Exchange('important'),
+          queue_arguments={'x-max-length': 1500} # Limits to 100 messages
+    ),
+)
+
 # One queue per channel — matches queue_name field in notification_jobs
 celery_app.conf.task_queues = (
     Queue("email-notify-q"),
@@ -17,6 +25,7 @@ celery_app.conf.task_queues = (
     Queue("whatsapp-notify-q"),
     Queue("push-notify-q"),
 )
+celery_app.conf.task_create_missing_queues = True
 
 # Route the send_notification task — queue is chosen dynamically at dispatch time
 # via apply_async(queue=...) in main.py, so no static routing needed here.

@@ -5,6 +5,7 @@ body {
     background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
     min-height: 100vh;
     color: #111827;
+    overflow-x: hidden;
 }
 
 /* 2. Main Container & Card */
@@ -235,17 +236,24 @@ body {
 /* ---------------- DASHBOARD LAYOUT ---------------- */
 .dashboard-container {
     display: flex;
-    height: 100vh;
+    min-height: 100vh;
+    align-items: flex-start;
 }
 
 /* Sidebar */
 .sidebar {
     width: 240px;
+    min-width: 240px;
     background: #1e293b;
     color: white;
     padding: 20px;
     display: flex;
     flex-direction: column;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    box-sizing: border-box;
 }
 
 .sidebar h3 {

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Header, Response
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, Response, UploadFile, File, Query, Form
 from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -12,13 +12,23 @@ import json
 import threading
 import secrets
 import time
+import math
+import re
+import mimetypes
+from pathlib import Path
 from collections import defaultdict
+from urllib.parse import urlparse
+import ipaddress
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from celery_config import celery_app
 from tasks import send_notification
 from dlq_processor import run_worker
+from kombu import Connection
+import requests as http_requests
 
 load_dotenv()
 
@@ -48,6 +58,772 @@ providers_collection             = db["providers"]
 dlq_collection                   = db["dlq"]
 clients_collection               = db["clients"]
 global_rate_limit_logs_collection = db["global_rate_limit_logs"]
+queue_controls_collection        = db["queue_controls"]
+webhook_calls_collection        = db["webhook_calls"]
+ultramsg_inbound_collection     = db["ultramsg_inbound"]
+media_files_collection         = db["media_files"]
+
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", os.path.join(os.path.dirname(__file__), "media_store"))).resolve()
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET", "")
+CHANNELS = ("email", "sms", "whatsapp", "push")
+QUEUE_FAILOVER_ENABLED = str(os.getenv("QUEUE_FAILOVER_ENABLED", "1")).strip().lower() in {"1", "true", "yes"}
+PRIMARY_QUEUE_CONGESTION_DEPTH = max(1, int(os.getenv("PRIMARY_QUEUE_CONGESTION_DEPTH", "100")))
+PRIMARY_QUEUE_MAX_BUFFER = max(PRIMARY_QUEUE_CONGESTION_DEPTH, int(os.getenv("PRIMARY_QUEUE_MAX_BUFFER", "500")))
+PRIMARY_QUEUE_RECOVER_DEPTH = max(0, int(os.getenv("PRIMARY_QUEUE_RECOVER_DEPTH", str(max(10, PRIMARY_QUEUE_CONGESTION_DEPTH // 2)))))
+PRIMARY_QUEUE_STUCK_SECONDS = max(5, int(os.getenv("PRIMARY_QUEUE_STUCK_SECONDS", "60")))
+QUEUE_FAILOVER_MONITOR_INTERVAL_SEC = max(2, int(os.getenv("QUEUE_FAILOVER_MONITOR_INTERVAL_SEC", "5")))
+QUEUE_FAILOVER_MIN_SWITCH_SECONDS = max(5, int(os.getenv("QUEUE_FAILOVER_MIN_SWITCH_SECONDS", "30")))
+
+
+def _guess_mime(filename: str, fallback: str = "application/octet-stream") -> str:
+    mt, _ = mimetypes.guess_type(filename or "")
+    return mt or fallback
+
+
+def _public_url_for(request: Request, path: str) -> str:
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}{path}"
+    # request.base_url already has trailing slash
+    return str(request.base_url).rstrip("/") + path
+
+
+def _build_media_url(request: Request, doc: dict, include_token: bool = True) -> Optional[str]:
+    if not isinstance(doc, dict):
+        return None
+    source_url = doc.get("source_url")
+    if source_url:
+        return str(source_url)
+
+    file_id = doc.get("file_id")
+    if not file_id:
+        return None
+
+    path = f"/media/{file_id}"
+    token = doc.get("access_token")
+    if include_token and token:
+        path = f"{path}?token={token}"
+    return _public_url_for(request, path)
+
+
+def _is_publicly_reachable_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(str(url).strip())
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False
+    if hostname in {"localhost", "0.0.0.0"} or hostname.endswith(".local"):
+        return False
+
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Domain names are treated as potentially public.
+        return True
+
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _normalize_attachments(request: Request, content: dict) -> dict:
+    """
+    Accept attachments inside content in either of these shapes:
+      - {"attachments": [{"file_id": "..."}]}
+      - {"attachments": [{"url": "https://...", "name": "...", "mime_type": "...", "size_bytes": 123}]}
+
+    Produces:
+      content["attachments"] = [{url,name,mime_type,size_bytes,file_id}, ...]
+    """
+    content = dict(content or {})
+    atts = content.get("attachments")
+    if not isinstance(atts, list):
+        return content
+
+    normalized = []
+    for a in atts:
+        if not isinstance(a, dict):
+            continue
+        file_id = a.get("file_id")
+        url = a.get("url")
+        name = a.get("name") or a.get("filename")
+        mime_type = a.get("mime_type") or (a.get("content_type"))
+        size_bytes = a.get("size_bytes")
+
+        if file_id and not url:
+            doc = media_files_collection.find_one({"file_id": str(file_id)}, {"_id": 0})
+            if doc:
+                url = _build_media_url(request, doc, include_token=True)
+                name = name or doc.get("original_name")
+                mime_type = mime_type or doc.get("mime_type")
+                size_bytes = size_bytes or doc.get("size_bytes")
+                if a.get("delivery_mode") is None and doc.get("delivery_mode"):
+                    a = {**a, "delivery_mode": doc.get("delivery_mode")}
+
+        if url:
+            normalized.append({
+                "file_id": (str(file_id) if file_id else None),
+                "url": str(url),
+                "name": str(name) if name else None,
+                "mime_type": str(mime_type) if mime_type else _guess_mime(name or ""),
+                "size_bytes": int(size_bytes) if isinstance(size_bytes, (int, float)) else None,
+                "delivery_mode": str(a.get("delivery_mode")) if a.get("delivery_mode") else None,
+            })
+
+    content["attachments"] = normalized
+    return content
+
+
+def _validate_channel_attachments(channel: str, content: dict) -> None:
+    """
+    WhatsApp providers fetch media from the attachment URL themselves.
+    Localhost/private URLs work in local testing for upload, but not from the provider's servers.
+    """
+    normalized_channel = (channel or "").strip().lower()
+    if normalized_channel != "whatsapp":
+        return
+
+    invalid_targets = []
+    for a in (content.get("attachments") or []):
+        if not isinstance(a, dict):
+            continue
+        url = a.get("url")
+        if not url:
+            continue
+        if _is_publicly_reachable_url(url):
+            continue
+        invalid_targets.append({
+            "file_id": a.get("file_id"),
+            "url": str(url),
+            "name": a.get("name"),
+        })
+
+    if invalid_targets:
+        first = invalid_targets[0]
+        attachment_label = first.get("file_id") or first.get("name") or first["url"]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "WhatsApp attachments must use a publicly reachable URL. "
+                f"Attachment '{attachment_label}' resolved to '{first['url']}', which is not public. "
+                "Set PUBLIC_BASE_URL to a public HTTPS host (for example an ngrok URL) before using "
+                "local uploaded files as WhatsApp attachments."
+            ),
+        )
+
+
+def _emit_client_webhook(client_id: str, event: dict) -> None:
+    """
+    Best-effort webhook dispatch to the client's configured webhook_url.
+    Never raises.
+    """
+    try:
+        cid = (client_id or "").strip()
+        if not cid:
+            return
+        client_doc = clients_collection.find_one({"client_id": cid}, {"_id": 0, "webhook_url": 1})
+        url = (client_doc or {}).get("webhook_url")
+        if not url:
+            return
+
+        started_at = datetime.utcnow()
+        try:
+            resp = http_requests.post(url, json=event, timeout=5)
+            ok = 200 <= resp.status_code < 300
+            webhook_calls_collection.insert_one({
+                "call_id":    f"wh_{uuid.uuid4().hex[:12]}",
+                "client_id":  cid,
+                "url":        url,
+                "status":     "SUCCESS" if ok else "FAILED",
+                "http_status": resp.status_code,
+                "response_body": (resp.text[:2000] if resp.text else None),
+                "event":      event,
+                "created_at": started_at,
+            })
+        except Exception as e:
+            webhook_calls_collection.insert_one({
+                "call_id":    f"wh_{uuid.uuid4().hex[:12]}",
+                "client_id":  cid,
+                "url":        url,
+                "status":     "ERROR",
+                "error":      str(e),
+                "event":      event,
+                "created_at": started_at,
+            })
+    except Exception:
+        return
+
+
+def _percentile(sorted_values: list[int], p: float) -> Optional[int]:
+    """
+    Nearest-rank percentile over a pre-sorted list.
+    p in [0,100].
+    """
+    if not sorted_values:
+        return None
+    if p <= 0:
+        return int(sorted_values[0])
+    if p >= 100:
+        return int(sorted_values[-1])
+    k = int(math.ceil((p / 100.0) * len(sorted_values))) - 1
+    k = max(0, min(k, len(sorted_values) - 1))
+    return int(sorted_values[k])
+
+
+def _require_bearer_token(authorization: Optional[str] = Header(default=None)):
+    """
+    UI sends Authorization: Bearer <token>.
+    We only require presence (admin auth is handled by the login service).
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    return token
+
+
+def _normalize_channel(queue_label: str) -> str:
+    """
+    Accepts UI values like 'EMAIL'/'WHATSAPP'/'SMS' or queue names like 'whatsapp-notify-q'.
+    Returns canonical channel: email|sms|whatsapp|push
+    """
+    raw = (queue_label or "").strip().lower()
+    if raw in {"email", "sms", "whatsapp", "push"}:
+        return raw
+    if "-notify-q-backup" in raw:
+        return raw.split("-notify-q-backup", 1)[0]
+    if raw.endswith("-notify-q"):
+        return raw.replace("-notify-q", "")
+    # UI dropdown uses uppercase labels
+    if raw in {"email", "e-mail"}:
+        return "email"
+    if raw in {"wa", "whatsapp"}:
+        return "whatsapp"
+    if raw in {"sms", "text"}:
+        return "sms"
+    if raw in {"push", "fcm"}:
+        return "push"
+    # Fall back (keeps behavior predictable)
+    return raw or "email"
+
+
+def _channel_to_queue_name(channel: str) -> str:
+    channel = (channel or "").strip().lower()
+    return f"{channel}-notify-q"
+
+
+def _channel_to_backup_queue_name(channel: str) -> str:
+    channel = (channel or "").strip().lower()
+    return f"{channel}-notify-q-backup"
+
+
+def _queue_role(queue_name: str) -> str:
+    raw = (queue_name or "").strip().lower()
+    if "-notify-q-backup" in raw:
+        return "backup"
+    return "primary"
+
+
+def _default_queue_control(channel: str) -> dict:
+    return {
+        "channel": channel,
+        "paused": False,
+        # rate_limit is stored as jobs/min (0 means "unset" -> fall back to hardcoded RATE_LIMITS)
+        "rate_limit": 0,
+        "active_queue": _channel_to_queue_name(channel),
+        "backup_queue": None,
+        "backup_enabled": True,
+        "congestion_depth": PRIMARY_QUEUE_CONGESTION_DEPTH,
+        "primary_max_buffer": PRIMARY_QUEUE_MAX_BUFFER,
+        "recover_depth": PRIMARY_QUEUE_RECOVER_DEPTH,
+        "stuck_seconds": PRIMARY_QUEUE_STUCK_SECONDS,
+    }
+
+def _safe_set_on_insert(default_doc: dict, set_doc: dict) -> dict:
+    """
+    MongoDB rejects updates that modify the same path in multiple operators
+    (e.g., $set and $setOnInsert). This helper removes any overlapping keys.
+    """
+    try:
+        blocked = set((set_doc or {}).keys())
+    except Exception:
+        blocked = set()
+    return {k: v for k, v in (default_doc or {}).items() if k not in blocked}
+
+
+def _get_or_init_queue_control(channel: str) -> dict:
+    channel = (channel or "").strip().lower()
+    doc = queue_controls_collection.find_one({"channel": channel}, {"_id": 0})
+    if doc:
+        # Migrate legacy field name "rate limit" → "rate_limit"
+        if "rate_limit" not in doc and "rate limit" in doc:
+            try:
+                legacy_val = int(doc.get("rate limit") or 0)
+            except Exception:
+                legacy_val = 0
+            queue_controls_collection.update_one(
+                {"channel": channel},
+                {"$set": {"rate_limit": legacy_val, "updated_at": datetime.utcnow()}, "$unset": {"rate limit": ""}},
+            )
+            doc["rate_limit"] = legacy_val
+            doc.pop("rate limit", None)
+
+        legacy_backup = _channel_to_backup_queue_name(channel)
+        if doc.get("backup_queue") == legacy_backup and doc.get("active_queue") != legacy_backup:
+            doc["backup_queue"] = None
+        merged = {**_default_queue_control(channel), **doc}
+        missing = {k: v for k, v in merged.items() if k not in doc}
+        if missing:
+            queue_controls_collection.update_one(
+                {"channel": channel},
+                {"$set": {**missing, "updated_at": datetime.utcnow()}},
+            )
+        return merged
+    doc = {**_default_queue_control(channel), "updated_at": datetime.utcnow()}
+    queue_controls_collection.update_one({"channel": channel}, {"$setOnInsert": doc}, upsert=True)
+    doc.pop("updated_at", None)
+    return _default_queue_control(channel)
+
+
+def _purge_rabbitmq_queue(queue_name: str) -> int:
+    """
+    Purge messages from a specific RabbitMQ queue.
+    Returns number of messages purged (best-effort).
+    """
+    broker_url = celery_app.conf.broker_url or "amqp://guest:guest@localhost:5672//"
+    with Connection(broker_url) as conn:
+        channel = conn.channel()
+        try:
+            result = channel.queue_purge(queue=queue_name)
+            # kombu returns an integer on some versions, dict on others
+            if isinstance(result, int):
+                return result
+            if isinstance(result, dict):
+                return int(result.get("message_count", 0))
+            return 0
+        finally:
+            channel.close()
+
+
+def _rabbitmq_queue_depth(queue_name: str) -> int:
+    """Get message count in a queue (passive declare)."""
+    broker_url = celery_app.conf.broker_url or "amqp://guest:guest@localhost:5672//"
+    with Connection(broker_url) as conn:
+        channel = conn.channel()
+        try:
+            q = channel.queue_declare(queue=queue_name, passive=True)
+            # q is (queue, message_count, consumer_count) in many kombu versions
+            if isinstance(q, tuple) and len(q) >= 2:
+                return int(q[1])
+            # sometimes q is a dict-like
+            if isinstance(q, dict):
+                return int(q.get("message_count", 0))
+            return 0
+        finally:
+            channel.close()
+
+
+def _rabbitmq_queue_stats(queue_name: str) -> dict:
+    """
+    Best-effort queue stats from passive declare.
+    Returns waiting message count and consumer count.
+    """
+    broker_url = celery_app.conf.broker_url or "amqp://guest:guest@localhost:5672//"
+    with Connection(broker_url) as conn:
+        channel = conn.channel()
+        try:
+            q = channel.queue_declare(queue=queue_name, passive=True)
+            if isinstance(q, tuple):
+                return {
+                    "queue_name": queue_name,
+                    "message_count": int(q[1]) if len(q) >= 2 else 0,
+                    "consumer_count": int(q[2]) if len(q) >= 3 else 0,
+                }
+            if isinstance(q, dict):
+                return {
+                    "queue_name": queue_name,
+                    "message_count": int(q.get("message_count", 0)),
+                    "consumer_count": int(q.get("consumer_count", 0)),
+                }
+            return {"queue_name": queue_name, "message_count": 0, "consumer_count": 0}
+        finally:
+            channel.close()
+
+
+def _declare_rabbitmq_queue(queue_name: str) -> None:
+    broker_url = celery_app.conf.broker_url or "amqp://guest:guest@localhost:5672//"
+    with Connection(broker_url) as conn:
+        q = Queue(queue_name)
+        q.maybe_bind(conn)
+        q.declare()
+
+
+def _delete_rabbitmq_queue(queue_name: str) -> None:
+    broker_url = celery_app.conf.broker_url or "amqp://guest:guest@localhost:5672//"
+    with Connection(broker_url) as conn:
+        channel = conn.channel()
+        try:
+            channel.queue_delete(queue=queue_name)
+        finally:
+            channel.close()
+
+
+def _attach_workers_to_queue(queue_name: str) -> None:
+    try:
+        celery_app.control.add_consumer(queue_name, reply=False)
+    except Exception as exc:
+        print(f"[QUEUE_FAILOVER] add_consumer failed for {queue_name}: {exc}")
+
+
+def _detach_workers_from_queue(queue_name: str) -> None:
+    try:
+        celery_app.control.cancel_consumer(queue_name, reply=False)
+    except Exception as exc:
+        print(f"[QUEUE_FAILOVER] cancel_consumer failed for {queue_name}: {exc}")
+
+
+def _new_dynamic_backup_queue_name(channel: str) -> str:
+    channel = (channel or "").strip().lower() or "email"
+    return f"{channel}-notify-q-backup-{uuid.uuid4().hex[:8]}"
+
+
+def _serialize_job_for_celery(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_serialize_job_for_celery(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _serialize_job_for_celery(v) for k, v in value.items() if k != "_id"}
+    return value
+
+
+def _parse_any_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+    return None
+
+
+def _oldest_queued_job_age_seconds(channel: str, queue_name: str) -> int:
+    doc = notification_jobs_collection.find_one(
+        {"channel": channel, "queue_name": queue_name, "status": "QUEUED"},
+        {"_id": 0, "created_at": 1, "updated_at": 1},
+        sort=[("created_at", 1)],
+    )
+    if not doc:
+        return 0
+    ts = _parse_any_datetime(doc.get("updated_at")) or _parse_any_datetime(doc.get("created_at"))
+    if not ts:
+        return 0
+    return max(0, int((datetime.utcnow() - ts).total_seconds()))
+
+
+def _primary_queue_health(channel: str) -> dict:
+    channel = (channel or "").strip().lower() or "email"
+    control = _get_or_init_queue_control(channel)
+    primary_queue = _channel_to_queue_name(channel)
+    backup_queue = control.get("backup_queue")
+
+    try:
+        primary_stats = _rabbitmq_queue_stats(primary_queue)
+        primary_error = None
+    except Exception as exc:
+        primary_stats = {"queue_name": primary_queue, "message_count": 0, "consumer_count": 0}
+        primary_error = str(exc)
+
+    if backup_queue:
+        try:
+            backup_stats = _rabbitmq_queue_stats(backup_queue)
+            backup_error = None
+        except Exception as exc:
+            backup_stats = {"queue_name": backup_queue, "message_count": 0, "consumer_count": 0}
+            backup_error = str(exc)
+    else:
+        backup_stats = {"queue_name": None, "message_count": 0, "consumer_count": 0}
+        backup_error = None
+
+    congestion_depth = int(control.get("congestion_depth", PRIMARY_QUEUE_CONGESTION_DEPTH))
+    primary_max_buffer = int(control.get("primary_max_buffer", PRIMARY_QUEUE_MAX_BUFFER))
+    recover_depth = int(control.get("recover_depth", PRIMARY_QUEUE_RECOVER_DEPTH))
+    stuck_seconds = int(control.get("stuck_seconds", PRIMARY_QUEUE_STUCK_SECONDS))
+    oldest_age = _oldest_queued_job_age_seconds(channel, primary_queue)
+
+    reasons = []
+    if primary_error:
+        reasons.append("primary_unavailable")
+    if primary_stats["message_count"] >= congestion_depth:
+        reasons.append("primary_congested")
+    if primary_stats["message_count"] >= primary_max_buffer:
+        reasons.append("primary_buffer_full")
+    if primary_stats["message_count"] > 0 and primary_stats["consumer_count"] <= 0:
+        reasons.append("primary_no_consumers")
+    if primary_stats["message_count"] > 0 and oldest_age >= stuck_seconds:
+        reasons.append("primary_stuck")
+
+    unhealthy = bool(reasons)
+    recoverable = (
+        not primary_error
+        and primary_stats["consumer_count"] > 0
+        and primary_stats["message_count"] <= recover_depth
+        and oldest_age < stuck_seconds
+    )
+
+    return {
+        "channel": channel,
+        "control": control,
+        "primary_queue": primary_queue,
+        "backup_queue": backup_queue,
+        "primary_stats": primary_stats,
+        "backup_stats": backup_stats,
+        "primary_error": primary_error,
+        "backup_error": backup_error,
+        "oldest_queued_age_seconds": oldest_age,
+        "unhealthy": unhealthy,
+        "recoverable": recoverable,
+        "reasons": reasons,
+    }
+
+
+def _should_switch_queue(control: dict, target_queue: str) -> bool:
+    current = control.get("active_queue") or _channel_to_queue_name(control.get("channel") or "email")
+    if current == target_queue:
+        return False
+    last = _parse_any_datetime(control.get("last_failover_at"))
+    if not last:
+        return True
+    return (datetime.utcnow() - last).total_seconds() >= QUEUE_FAILOVER_MIN_SWITCH_SECONDS
+
+
+def _ensure_dynamic_backup_queue(channel: str) -> str:
+    channel = (channel or "").strip().lower() or "email"
+    control = _get_or_init_queue_control(channel)
+    existing = control.get("backup_queue")
+    if existing:
+        return str(existing)
+
+    backup_queue = _new_dynamic_backup_queue_name(channel)
+    _declare_rabbitmq_queue(backup_queue)
+    _attach_workers_to_queue(backup_queue)
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {
+            "$set": {
+                "backup_queue": backup_queue,
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": _safe_set_on_insert(_default_queue_control(channel), {"backup_queue": backup_queue, "updated_at": datetime.utcnow()}),
+        },
+        upsert=True,
+    )
+    print(f"[QUEUE_FAILOVER] Created dynamic backup queue for {channel}: {backup_queue}")
+    return backup_queue
+
+
+def _set_channel_active_queue(channel: str, target_queue: str, reason: Optional[str]) -> None:
+    channel = (channel or "").strip().lower() or "email"
+    queue_role = _queue_role(target_queue)
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {
+            "$set": {
+                "active_queue": target_queue,
+                "backup_queue": (target_queue if queue_role == "backup" else _get_or_init_queue_control(channel).get("backup_queue")),
+                "backup_enabled": True,
+                "last_failover_reason": reason,
+                "last_failover_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": _safe_set_on_insert(
+                _default_queue_control(channel),
+                {
+                    "active_queue": target_queue,
+                    "backup_queue": (target_queue if queue_role == "backup" else _get_or_init_queue_control(channel).get("backup_queue")),
+                    "backup_enabled": True,
+                    "last_failover_reason": reason,
+                    "last_failover_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                },
+            ),
+        },
+        upsert=True,
+    )
+
+
+def _cleanup_dynamic_backup_queue(channel: str) -> None:
+    channel = (channel or "").strip().lower() or "email"
+    control = _get_or_init_queue_control(channel)
+    backup_queue = control.get("backup_queue")
+    if not backup_queue:
+        return
+    if backup_queue == _channel_to_queue_name(channel):
+        return
+
+    queued_jobs = notification_jobs_collection.count_documents(
+        {"channel": channel, "queue_name": backup_queue, "status": "QUEUED"}
+    )
+    try:
+        stats = _rabbitmq_queue_stats(backup_queue)
+        broker_waiting = int(stats.get("message_count", 0))
+    except Exception:
+        broker_waiting = 0
+
+    if queued_jobs > 0 or broker_waiting > 0:
+        return
+
+    _detach_workers_from_queue(backup_queue)
+    try:
+        _delete_rabbitmq_queue(backup_queue)
+    except Exception as exc:
+        print(f"[QUEUE_FAILOVER] Could not delete backup queue {backup_queue}: {exc}")
+        return
+
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {"$set": {"backup_queue": None, "updated_at": datetime.utcnow()}},
+    )
+    print(f"[QUEUE_FAILOVER] Removed dynamic backup queue for {channel}: {backup_queue}")
+
+
+def _redirect_queued_jobs(channel: str, source_queue: str, target_queue: str, reason: str) -> dict:
+    """
+    Best-effort broker drain + republish for jobs still marked QUEUED.
+    This moves only waiting jobs, not ones already processing.
+    """
+    docs = list(
+        notification_jobs_collection
+        .find(
+            {"channel": channel, "queue_name": source_queue, "status": "QUEUED"},
+            {"_id": 0},
+        )
+    )
+    if not docs:
+        return {"moved_jobs": 0, "purged_messages": 0}
+
+    purged = 0
+    try:
+        purged = _purge_rabbitmq_queue(source_queue)
+    except Exception:
+        purged = 0
+
+    moved = 0
+    switched_at = datetime.utcnow()
+    for doc in docs:
+        updated = notification_jobs_collection.update_one(
+            {"job_id": doc.get("job_id"), "status": "QUEUED", "queue_name": source_queue},
+            {
+                "$set": {
+                    "queue_name": target_queue,
+                    "queue_role": _queue_role(target_queue),
+                    "updated_at": switched_at,
+                    "failover_meta": {
+                        "reason": reason,
+                        "source_queue": source_queue,
+                        "target_queue": target_queue,
+                        "switched_at": switched_at,
+                    },
+                }
+            },
+        )
+        if updated.modified_count <= 0:
+            continue
+        payload = _serialize_job_for_celery({**doc, "queue_name": target_queue, "queue_role": _queue_role(target_queue)})
+        send_notification.apply_async(args=[payload], queue=target_queue)
+        moved += 1
+
+    return {"moved_jobs": moved, "purged_messages": purged}
+
+
+def _reconcile_channel_failover(channel: str, *, drain_primary: bool) -> dict:
+    health = _primary_queue_health(channel)
+    control = health["control"]
+    primary_queue = health["primary_queue"]
+    backup_queue = health["backup_queue"]
+    active_queue = control.get("active_queue") or primary_queue
+
+    if health["unhealthy"] and control.get("backup_enabled", True):
+        if not backup_queue:
+            backup_queue = _ensure_dynamic_backup_queue(channel)
+            health["backup_queue"] = backup_queue
+        else:
+            _attach_workers_to_queue(backup_queue)
+        if _should_switch_queue(control, backup_queue):
+            reason = ",".join(health["reasons"]) or "primary_unhealthy"
+            _set_channel_active_queue(channel, backup_queue, reason)
+            moved = {"moved_jobs": 0, "purged_messages": 0}
+            if drain_primary:
+                moved = _redirect_queued_jobs(channel, primary_queue, backup_queue, reason)
+            health["active_queue"] = backup_queue
+            health["failover_action"] = {"target_queue": backup_queue, **moved, "reason": reason}
+            return health
+        health["active_queue"] = active_queue
+        return health
+
+    if active_queue == backup_queue and health["recoverable"] and _should_switch_queue(control, primary_queue):
+        _set_channel_active_queue(channel, primary_queue, "primary_recovered")
+        health["active_queue"] = primary_queue
+        health["failover_action"] = {"target_queue": primary_queue, "moved_jobs": 0, "purged_messages": 0, "reason": "primary_recovered"}
+        _cleanup_dynamic_backup_queue(channel)
+        return health
+
+    health["active_queue"] = active_queue
+    if active_queue == backup_queue and backup_queue:
+        _attach_workers_to_queue(backup_queue)
+    if active_queue == primary_queue:
+        _cleanup_dynamic_backup_queue(channel)
+    return health
+
+
+def _select_queue_for_dispatch(channel: str) -> str:
+    channel = (channel or "").strip().lower() or "email"
+    if not QUEUE_FAILOVER_ENABLED:
+        return _channel_to_queue_name(channel)
+    health = _reconcile_channel_failover(channel, drain_primary=False)
+    return health.get("active_queue") or _channel_to_queue_name(channel)
+
+
+def run_queue_failover_monitor():
+    if not QUEUE_FAILOVER_ENABLED:
+        return
+    print("[QUEUE_FAILOVER] Monitor started")
+    while True:
+        try:
+            for channel in CHANNELS:
+                _reconcile_channel_failover(channel, drain_primary=True)
+        except Exception as exc:
+            print(f"[QUEUE_FAILOVER] Monitor error (continuing): {exc}")
+        time.sleep(QUEUE_FAILOVER_MONITOR_INTERVAL_SEC)
+
+
+if QUEUE_FAILOVER_ENABLED:
+    threading.Thread(target=run_queue_failover_monitor, daemon=True).start()
+
+
+class QueueControlBody(BaseModel):
+    queue: str
+
+
+class QueueRateLimitBody(BaseModel):
+    queue: str
+    rate: int
 
 
 # ── GLOBAL RATE LIMITING ──────────────────────────────────────────────────────
@@ -71,7 +847,7 @@ global_rate_limit_logs_collection = db["global_rate_limit_logs"]
 GLOBAL_RATE_LIMIT_CONFIG = {
     # Per IP address — applies to ALL endpoints
     "per_ip": {
-        "max_requests":   100,    # max requests per IP in the window
+        "max_requests":   5000,    # max requests per IP in the window
         "window_seconds": 60,     # rolling window length (1 minute)
     },
     # System-wide — applies across all IPs and clients combined
@@ -312,20 +1088,71 @@ def get_rate_limit_status():
     }
 
 
+@app.get("/rate-limit/effective/{channel}")
+def get_effective_rate_limit(channel: str, _: str = Depends(_require_bearer_token)):
+    """
+    Admin/debug endpoint: shows what the API will enforce for this channel
+    given hardcoded defaults + provider caps + admin-configured jobs/min.
+    """
+    ch = _normalize_channel(channel)
+    limits = RATE_LIMITS.get(ch) or {}
+    per_user = (limits.get("per_user") or {})
+    per_client = (limits.get("per_client") or {})
+
+    provider_cap_sec = _provider_cap_jobs_per_sec(ch)
+    provider_cap_min = max(0, int(provider_cap_sec * 60))
+    admin_cap_min = _admin_rate_limit_jobs_per_min(ch)
+
+    def _derived_max(window_seconds: int) -> int:
+        if admin_cap_min <= 0:
+            return 0
+        effective_cap_min = min(admin_cap_min, provider_cap_min) if provider_cap_min > 0 else admin_cap_min
+        return max(1, int(effective_cap_min * (float(window_seconds) / 60.0)))
+
+    return {
+        "channel": ch,
+        "admin_rate_limit_jobs_per_min": admin_cap_min,
+        "provider_cap_jobs_per_sec": provider_cap_sec,
+        "provider_cap_jobs_per_min": provider_cap_min,
+        "hardcoded": {
+            "per_user": per_user,
+            "per_client": per_client,
+        },
+        "effective": {
+            "per_user_max": (_derived_max(int(per_user.get("window_seconds") or 60)) if admin_cap_min > 0 else int(per_user.get("max") or 0)),
+            "per_user_window_seconds": int(per_user.get("window_seconds") or 0),
+            "per_client_max": (_derived_max(int(per_client.get("window_seconds") or 3600)) if admin_cap_min > 0 else int(per_client.get("max") or 0)),
+            "per_client_window_seconds": int(per_client.get("window_seconds") or 0),
+        },
+    }
+
+
 # ── RATE LIMIT CONFIGURATION ──────────────────────────────────────────────────
 # All windows are rolling (checked against now - window_seconds).
 
+# Provider-side hard caps (jobs/sec) per channel.
+# Admin-configured limits (via Queue Control UI) cannot exceed these.
+# You can override these with env vars:
+#   PROVIDER_CAP_EMAIL_JOBS_PER_SEC, PROVIDER_CAP_SMS_JOBS_PER_SEC,
+#   PROVIDER_CAP_WHATSAPP_JOBS_PER_SEC, PROVIDER_CAP_PUSH_JOBS_PER_SEC
+PROVIDER_RATE_CAPS_JOBS_PER_SEC = {
+    "email":    int(os.getenv("PROVIDER_CAP_EMAIL_JOBS_PER_SEC", "100")),
+    "sms":      int(os.getenv("PROVIDER_CAP_SMS_JOBS_PER_SEC", "20")),
+    "whatsapp": int(os.getenv("PROVIDER_CAP_WHATSAPP_JOBS_PER_SEC", "10")),
+    "push":     int(os.getenv("PROVIDER_CAP_PUSH_JOBS_PER_SEC", "200")),
+}
+
 RATE_LIMITS = {
     "email": {
-        "per_user":   {"max": 5,   "window_seconds": 60},      # 5 emails/user/minute
-        "per_client": {"max": 1000, "window_seconds": 3600},   # 1000 emails/client/hour
+        "per_user":   {"max": 5000,   "window_seconds": 60},    
+        "per_client": {"max": 5000, "window_seconds": 60},   
     },
     "sms": {
         "per_user":   {"max": 5,    "window_seconds": 3600},
         "per_client": {"max": 500,  "window_seconds": 3600},
     },
     "whatsapp": {
-        "per_user":   {"max": 5,    "window_seconds": 3600},
+        "per_user":   {"max": 5,    "window_seconds": 60},
         "per_client": {"max": 500,  "window_seconds": 3600},
     },
     "push": {
@@ -333,6 +1160,34 @@ RATE_LIMITS = {
         "per_client": {"max": 5000, "window_seconds": 3600},
     },
 }
+
+def _provider_cap_jobs_per_sec(channel: str) -> int:
+    channel = (channel or "").strip().lower() or "email"
+    cap = PROVIDER_RATE_CAPS_JOBS_PER_SEC.get(channel)
+    if cap is None:
+        cap = 50
+    return max(0, int(cap))
+
+
+def _admin_rate_limit_jobs_per_min(channel: str) -> int:
+    """
+    Returns admin-configured per-channel rate limit (jobs/min) from queue_controls.
+    0 means "unset" (fall back to hardcoded RATE_LIMITS).
+    """
+    channel = (channel or "").strip().lower() or "email"
+    doc = queue_controls_collection.find_one({"channel": channel}, {"_id": 0, "rate_limit": 1, "rate limit": 1})
+    try:
+        if doc and "rate_limit" not in doc and "rate limit" in doc:
+            # best-effort migrate on read
+            legacy_val = max(0, int(doc.get("rate limit", 0) or 0))
+            queue_controls_collection.update_one(
+                {"channel": channel},
+                {"$set": {"rate_limit": legacy_val, "updated_at": datetime.utcnow()}, "$unset": {"rate limit": ""}},
+            )
+            return legacy_val
+        return max(0, int((doc or {}).get("rate_limit", 0)))
+    except Exception:
+        return 0
 
 
 # ── CLIENT AUTHENTICATION ────────────────────────────────────────────────────
@@ -384,6 +1239,14 @@ async def verify_api_key(
     # token-level constraints (for example, event_type-bound API keys).
     client_doc["_verified_key_hash"] = key_hash
     return client_doc
+
+
+async def verify_api_key_optional(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Optional[dict]:
+    if not x_api_key:
+        return None
+    return await verify_api_key(x_api_key)
 
 
 # ── MODELS ────────────────────────────────────────────────────────────────────
@@ -488,23 +1351,43 @@ def check_rate_limit(user_id: str, client_id: str, channel: str) -> dict:
             return dt.replace(tzinfo=None)
         return dt
 
+    statuses = ["QUEUED", "PROCESSING", "SENT", "DELIVERED", "READ"]
+
+    provider_cap_sec = _provider_cap_jobs_per_sec(channel)
+    provider_cap_min = max(0, int(provider_cap_sec * 60))
+    admin_cap_min = _admin_rate_limit_jobs_per_min(channel)
+
     # ── 1. Per-user check ────────────────────────────────────────────────────
     user_cfg    = limits["per_user"]
     user_window = timedelta(seconds=user_cfg["window_seconds"])
     user_since  = now_utc - user_window
 
-    user_count = notification_jobs_collection.count_documents({
-        "channel":           channel,
-        "recipient.user_id": user_id,
-        "created_at":        {"$gte": user_since},
-        "status":            {"$in": ["QUEUED", "PROCESSING", "SENT", "DELIVERED", "READ"]},
-    })
+    # If admin cap is set (>0), override hardcoded per-user max too.
+    if admin_cap_min > 0:
+        effective_cap_min = min(admin_cap_min, provider_cap_min) if provider_cap_min > 0 else admin_cap_min
+        derived_user_max = max(1, int(effective_cap_min * (user_cfg["window_seconds"] / 60.0)))
+        effective_user_max = derived_user_max
+    else:
+        effective_user_max = int(user_cfg["max"])
 
-    if user_count >= user_cfg["max"]:
+    # 1 job doc can contain many recipients; count per-recipient occurrences.
+    user_count_docs = list(notification_jobs_collection.aggregate([
+        {"$match": {
+            "channel":    channel,
+            "created_at": {"$gte": user_since},
+            "status":     {"$in": statuses},
+        }},
+        {"$unwind": "$recipients"},
+        {"$match": {"recipients.recipient.user_id": user_id}},
+        {"$count": "n"},
+    ]))
+    user_count = int((user_count_docs[0]["n"] if user_count_docs else 0))
+
+    if user_count >= effective_user_max:
         oldest = notification_jobs_collection.find_one(
             {
                 "channel":           channel,
-                "recipient.user_id": user_id,
+                "recipients.recipient.user_id": user_id,
                 "created_at":        {"$gte": user_since},
             },
             sort=[("created_at", 1)],
@@ -517,12 +1400,12 @@ def check_rate_limit(user_id: str, client_id: str, channel: str) -> dict:
 
         now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
         _log_rate_limit_hit(user_id, client_id, channel, "user",
-                            user_count, user_cfg["max"], now_ist)
+                            user_count, effective_user_max, now_ist)
         return {
             "allowed":             False,
             "scope":               "user",
             "count":               user_count,
-            "limit":               user_cfg["max"],
+            "limit":               effective_user_max,
             "window_seconds":      user_cfg["window_seconds"],
             "retry_after_seconds": retry_after,
             "channel":             channel,
@@ -533,14 +1416,31 @@ def check_rate_limit(user_id: str, client_id: str, channel: str) -> dict:
     client_window = timedelta(seconds=client_cfg["window_seconds"])
     client_since  = now_utc - client_window
 
-    client_count = notification_jobs_collection.count_documents({
-        "channel":    channel,
-        "client_id":  client_id,
-        "created_at": {"$gte": client_since},
-        "status":     {"$in": ["QUEUED", "PROCESSING", "SENT", "DELIVERED", "READ"]},
-    })
+    # Effective per-client cap:
+    # - If admin cap is unset (0), fall back to hardcoded RATE_LIMITS.
+    # - If admin cap is set (>0), it OVERRIDES hardcoded per_client max,
+    #   and is capped only by provider capacity.
+    if admin_cap_min <= 0:
+        effective_client_max = int(client_cfg["max"])
+    else:
+        effective_cap_min = min(admin_cap_min, provider_cap_min) if provider_cap_min > 0 else admin_cap_min
+        # Convert jobs/min → jobs/window
+        derived_window_max = max(1, int(effective_cap_min * (client_cfg["window_seconds"] / 60.0)))
+        effective_client_max = derived_window_max
 
-    if client_count >= client_cfg["max"]:
+    client_count_docs = list(notification_jobs_collection.aggregate([
+        {"$match": {
+            "channel":    channel,
+            "client_id":  client_id,
+            "created_at": {"$gte": client_since},
+            "status":     {"$in": statuses},
+        }},
+        {"$project": {"n": {"$size": {"$ifNull": ["$recipients", []]}}}},
+        {"$group": {"_id": None, "total": {"$sum": "$n"}}},
+    ]))
+    client_count = int((client_count_docs[0]["total"] if client_count_docs else 0))
+
+    if client_count >= effective_client_max:
         oldest = notification_jobs_collection.find_one(
             {
                 "channel":    channel,
@@ -557,12 +1457,12 @@ def check_rate_limit(user_id: str, client_id: str, channel: str) -> dict:
 
         now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
         _log_rate_limit_hit(user_id, client_id, channel, "client",
-                            client_count, client_cfg["max"], now_ist)
+                            client_count, effective_client_max, now_ist)
         return {
             "allowed":             False,
             "scope":               "client",
             "count":               client_count,
-            "limit":               client_cfg["max"],
+            "limit":               effective_client_max,
             "window_seconds":      client_cfg["window_seconds"],
             "retry_after_seconds": retry_after,
             "channel":             channel,
@@ -674,7 +1574,7 @@ def register_client(body: dict):
     raw_key       = _generate_api_key()
     client_id     = f"client_{uuid.uuid4().hex[:12]}"
     now_ist       = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    monthly_quota = body.get("monthly_quota", 100000)
+    monthly_quota = body.get("monthly_quota", 10000000)
     allowed_channels = body.get("allowed_channels", ["email", "sms", "whatsapp", "push"])
 
     clients_collection.insert_one({
@@ -726,7 +1626,7 @@ def sync_client_from_node(body: dict):
     event_type = (body.get("event_type") or "DEFAULT").strip()
     if not event_type:
         event_type = "DEFAULT"
-    monthly_quota = int(body.get("monthly_quota", 100000))
+    monthly_quota = int(body.get("monthly_quota", 10000000))
     allowed_channels = body.get(
         "allowed_channels",
         ["email", "sms", "whatsapp", "push"],
@@ -823,6 +1723,125 @@ def rotate_api_key(client_id: str):
     }
 
 
+def _remove_media_files_for_query(query: dict) -> int:
+    media_docs = list(media_files_collection.find(query, {"_id": 0, "stored_path": 1}))
+    removed_media_files = 0
+    for doc in media_docs:
+        path = doc.get("stored_path")
+        if not path:
+            continue
+        try:
+            os.unlink(path)
+            removed_media_files += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return removed_media_files
+
+
+def _delete_client_scoped_data(client_id: str, *, delete_client_doc: bool = True) -> dict:
+    removed_media_files = _remove_media_files_for_query({"client_id": client_id})
+    deleted_counts = {
+        "clients": clients_collection.delete_one({"client_id": client_id}).deleted_count if delete_client_doc else 0,
+        "notification_requests": notification_requests_collection.delete_many({"client_id": client_id}).deleted_count,
+        "notification_jobs": notification_jobs_collection.delete_many({"client_id": client_id}).deleted_count,
+        "delivery_logs": delivery_logs_collection.delete_many({"client_id": client_id}).deleted_count,
+        "rate_limit_logs": rate_limit_logs_collection.delete_many({"client_id": client_id}).deleted_count,
+        "webhook_calls": webhook_calls_collection.delete_many({"client_id": client_id}).deleted_count,
+        "preferences": preferences_collection.delete_many({"client_id": client_id}).deleted_count,
+        "media_files": media_files_collection.delete_many({"client_id": client_id}).deleted_count,
+        "dlq": dlq_collection.delete_many({"client_id": client_id}).deleted_count,
+    }
+    deleted_counts["media_files_removed_from_disk"] = removed_media_files
+    return deleted_counts
+
+
+@app.delete("/clients")
+def delete_all_clients(_: str = Depends(_require_bearer_token)):
+    """
+    Admin-only destructive delete of every client account and related data.
+    """
+    client_ids = [
+        doc["client_id"]
+        for doc in clients_collection.find({}, {"_id": 0, "client_id": 1})
+        if doc.get("client_id")
+    ]
+    if not client_ids:
+        return {
+            "message": "No client accounts to delete.",
+            "deleted_client_ids": [],
+            "deleted_counts": {},
+        }
+
+    removed_media_files = _remove_media_files_for_query({"client_id": {"$in": client_ids}})
+    deleted_counts = {
+        "clients": clients_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "notification_requests": notification_requests_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "notification_jobs": notification_jobs_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "delivery_logs": delivery_logs_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "rate_limit_logs": rate_limit_logs_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "webhook_calls": webhook_calls_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "preferences": preferences_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "media_files": media_files_collection.delete_many({"client_id": {"$in": client_ids}}).deleted_count,
+        "dlq": dlq_collection.delete_many({"$or": [{"client_id": {"$in": client_ids}}, {"client_id": {"$exists": False}}]}).deleted_count,
+    }
+    deleted_counts["media_files_removed_from_disk"] = removed_media_files
+
+    return {
+        "message": f"Deleted {deleted_counts['clients']} client account(s).",
+        "deleted_client_ids": client_ids,
+        "deleted_counts": deleted_counts,
+    }
+
+
+@app.delete("/clients/{client_id}")
+def delete_client(client_id: str, _: str = Depends(_require_bearer_token)):
+    """
+    Admin-only destructive delete of a client and its client-scoped data.
+    Keeps the operation bounded to documents linked by client_id.
+    """
+    existing = clients_collection.find_one({"client_id": client_id}, {"_id": 0, "client_id": 1})
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Client '{client_id}' not found.")
+
+    deleted_counts = _delete_client_scoped_data(client_id)
+
+    return {
+        "message": f"Client '{client_id}' deleted.",
+        "client_id": client_id,
+        "deleted_counts": deleted_counts,
+    }
+
+
+# ── CLIENT WEBHOOK URL CONFIG ────────────────────────────────────────────────
+
+class WebhookUrlBody(BaseModel):
+    webhook_url: Optional[str] = None
+
+
+@app.get("/clients/{client_id}/webhook-url")
+def get_client_webhook_url(client_id: str, _: str = Depends(_require_bearer_token)):
+    doc = clients_collection.find_one({"client_id": client_id}, {"_id": 0, "client_id": 1, "webhook_url": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail=f"Client '{client_id}' not found.")
+    return {"client_id": client_id, "webhook_url": doc.get("webhook_url")}
+
+
+@app.put("/clients/{client_id}/webhook-url")
+def set_client_webhook_url(client_id: str, body: WebhookUrlBody, _: str = Depends(_require_bearer_token)):
+    url = (body.webhook_url or "").strip()
+    update = {"updated_at": datetime.utcnow() + timedelta(hours=5, minutes=30)}
+    if url:
+        update["webhook_url"] = url
+    else:
+        update["webhook_url"] = None
+    res = clients_collection.update_one({"client_id": client_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Client '{client_id}' not found.")
+    return {"message": "Webhook URL updated.", "client_id": client_id, "webhook_url": update["webhook_url"]}
+
+
 # ── PREFERENCES ROUTES ────────────────────────────────────────────────────────
 # user_id accepted two ways (header takes priority over body) for compatibility:
 #   1. X-User-Id request header  ← teammate's approach, cleaner for API clients
@@ -900,6 +1919,12 @@ _PROVIDER_DEFAULTS = {
     "whatsapp": [{"provider_name": "UltraMsg",    "provider_id": "ultramsg",    "priority": 1, "max_retries": 3, "timeout_ms": 5000}],
     "push":     [{"provider_name": "Firebase FCM","provider_id": "firebase_fcm","priority": 1, "max_retries": 3, "timeout_ms": 5000}],
 }
+_SUPPORTED_PROVIDER_NAMES = {
+    name
+    for providers in _PROVIDER_DEFAULTS.values()
+    for name in [p.get("provider_name") for p in providers]
+    if name
+}
 
 def _build_providers_snapshot(channel: str) -> list:
     """
@@ -915,7 +1940,12 @@ def _build_providers_snapshot(channel: str) -> list:
         ).sort("priority", 1)
     )
 
-    if db_providers:
+    valid_providers = [
+        p for p in db_providers
+        if p.get("provider_name") in _SUPPORTED_PROVIDER_NAMES
+    ]
+
+    if valid_providers:
         return [
             {
                 "provider_id":   p.get("provider_id"),
@@ -924,7 +1954,7 @@ def _build_providers_snapshot(channel: str) -> list:
                 "max_retries":   p.get("max_retries", 3),
                 "timeout_ms":    p.get("timeout_ms", 5000),
             }
-            for p in db_providers
+            for p in valid_providers
         ]
 
     # Fallback to hardcoded defaults
@@ -1098,6 +2128,7 @@ def enforce_channel_limits(channel: str, content: dict) -> dict:
 
 @app.post("/notify")
 def notify(
+    http_request: Request,
     request:    NotificationRequest,
     api_client: dict = Depends(verify_api_key),
 ):
@@ -1154,7 +2185,7 @@ def notify(
             )
 
     # ── Check monthly quota ───────────────────────────────────────────────────
-    monthly_quota = api_client.get("monthly_quota", 100000)
+    monthly_quota = api_client.get("monthly_quota", 10000000)
     month_start   = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_usage   = notification_jobs_collection.count_documents({
         "client_id":  request.client_id,
@@ -1199,7 +2230,7 @@ def notify(
 
     jobs_created: list[str]  = []
     jobs_blocked: list[dict] = []
-    channel_jobs: dict[str, list[str]] = {}
+    channel_recipients: dict[str, list[dict]] = {}
 
     for recipient in request.recipients:
         recipient_dict = recipient.dict()
@@ -1237,8 +2268,10 @@ def notify(
                 continue
 
             # ── Character limit enforcement ──────────────────────────────
+            normalized_content = _normalize_attachments(http_request, request.content or {})
+            _validate_channel_attachments(channel, normalized_content)
             channel_content = {
-                **(request.content or {}),
+                **normalized_content,
                 "user_id":    recipient.user_id,
                 "event_type": request.event_type,
             }
@@ -1261,14 +2294,11 @@ def notify(
             validated_content = limit_result["content"]
             # ─────────────────────────────────────────────────────────────────
 
-            job_id            = f"job_{uuid.uuid4().hex[:12]}"
             recipient_address = CHANNEL_ADDRESS_MAP.get(channel, lambda r: None)(recipient_dict)
 
-            job_doc = {
-                "job_id":           job_id,
-                "request_id":       request_id,
-                "client_id":        request.client_id,
-                "event_type":       request.event_type,
+            queue_name = _select_queue_for_dispatch(channel)
+
+            channel_recipients.setdefault(channel, []).append({
                 "recipient": {
                     "user_id":   recipient.user_id,
                     "email":     recipient.email,
@@ -1276,50 +2306,53 @@ def notify(
                     "wa_number": recipient.wa_number,
                     "fcm_token": recipient.fcm_token,
                 },
-                "channel":           channel,
-                "priority":          request.priority or "MEDIUM",
-                "template_id":       None,
-                "rendered_content":  None,
                 "recipient_address": recipient_address,
-                "retry_policy": {
-                    "max_attempts":    5,
-                    "current_attempt": 1,
-                    "backoff_seconds": [10, 30, 120, 600, 1800],
-                },
-                "queue_name": f"{channel}-notify-q",
-                # Use validated_content — already has user_id, event_type injected,
-                # and for SMS includes sms_segments if body was split.
                 "content": validated_content,
-                # providers_snapshot — ordered list of providers to try for this channel.
-                # tasks.py dispatch_with_failover() iterates through these on failure.
-                # Email has SendGrid as primary, SMTP as fallback.
-                "providers_snapshot": _build_providers_snapshot(channel),
-                "retry_meta": {
-                    "attempt":        1,
-                    "provider_index": 0,
-                },
-                "status":     "QUEUED",
-                # IMPORTANT: store as UTC so check_rate_limit() window queries work correctly.
-                # check_rate_limit uses datetime.utcnow() for $gte — must match storage clock.
-                "created_at": now_utc,
-                "updated_at": now_utc,
-            }
+                "retry_meta": {"attempt": 1, "provider_index": 0},
+            })
 
-            notification_jobs_collection.insert_one(job_doc)
-            job_doc.pop("_id", None)
-            job_doc["created_at"] = job_doc["created_at"].isoformat()
-            job_doc["updated_at"] = job_doc["updated_at"].isoformat()
+    # ── Dispatch: 1 job per channel ──────────────────────────────────────────
+    for channel, recipients_payload in channel_recipients.items():
+        if not recipients_payload:
+            continue
 
-            send_notification.apply_async(
-                args=[job_doc],
-                queue=job_doc["queue_name"],
-            )
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        queue_name = _select_queue_for_dispatch(channel)
 
-            jobs_created.append(job_id)
-            channel_jobs.setdefault(channel, []).append(job_id)
+        job_doc = {
+            "job_id":           job_id,
+            "request_id":       request_id,
+            "client_id":        request.client_id,
+            "event_type":       request.event_type,
+            "channel":          channel,
+            "priority":         request.priority or "MEDIUM",
+            "template_id":      None,
+            "rendered_content": None,
+            "recipients":       recipients_payload,
+            "retry_policy": {
+                "max_attempts":    5,
+                "current_attempt": 1,
+                "backoff_seconds": [10, 30, 120, 600, 1800],
+            },
+            "queue_name": queue_name,
+            "queue_role": _queue_role(queue_name),
+            "providers_snapshot": _build_providers_snapshot(channel),
+            "status":     "QUEUED",
+            "created_at": now_utc,
+            "updated_at": now_utc,
+        }
 
-    for channel, job_ids in channel_jobs.items():
-        print(f"[QUEUE] {channel}-notify-q  <- {len(job_ids)} job(s): {', '.join(job_ids)}")
+        notification_jobs_collection.insert_one(job_doc)
+        job_doc.pop("_id", None)
+        job_doc["created_at"] = job_doc["created_at"].isoformat()
+        job_doc["updated_at"] = job_doc["updated_at"].isoformat()
+
+        send_notification.apply_async(args=[job_doc], queue=queue_name)
+
+        jobs_created.append(job_id)
+
+    for channel, recs in channel_recipients.items():
+        print(f"[QUEUE] {channel} active_queue={_select_queue_for_dispatch(channel)} <- 1 job(s) for {len(recs)} recipient(s)")
 
     final_status = "JOBS_CREATED" if jobs_created else "FAILED"
     notification_requests_collection.update_one(
@@ -1352,11 +2385,154 @@ def notify(
     }
 
 
+# ── MEDIA UPLOAD + SERVE ──────────────────────────────────────────────────────
+#
+# Large docs/videos should be uploaded once, then referenced by file_id or URL in notify payload.
+# This keeps /notify small and avoids base64 payload bloat.
+#
+
+@app.post("/media/upload")
+async def upload_media(
+    http_request: Request,
+    file: Optional[UploadFile] = File(default=None),
+    remote_url: Optional[str] = Form(default=None),
+    name: Optional[str] = Form(default=None),
+    mime_type: Optional[str] = Form(default=None),
+    size_bytes: Optional[int] = Form(default=None),
+    delivery_mode: Optional[str] = Form(default=None),
+    api_client: dict = Depends(verify_api_key),
+):
+    if not file and not remote_url:
+        raise HTTPException(status_code=400, detail="Provide either a file upload or remote_url.")
+    if file and remote_url:
+        raise HTTPException(status_code=400, detail="Provide only one of file or remote_url.")
+
+    max_mb = int(os.getenv("MEDIA_UPLOAD_MAX_MB", "250"))
+    max_bytes = max_mb * 1024 * 1024
+    normalized_delivery_mode = (delivery_mode or "").strip().lower() or None
+    if normalized_delivery_mode not in {None, "auto", "link_only", "provider_media"}:
+        raise HTTPException(
+            status_code=400,
+            detail="delivery_mode must be one of: auto, link_only, provider_media.",
+        )
+
+    if remote_url:
+        normalized_url = remote_url.strip()
+        if not normalized_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="remote_url must start with http:// or https://")
+
+        file_id = f"mf_{uuid.uuid4().hex[:12]}"
+        resolved_name = (name or normalized_url.rstrip("/").split("/")[-1] or "remote-file").strip()
+        resolved_mime = mime_type or _guess_mime(resolved_name)
+        doc = {
+            "file_id": file_id,
+            "client_id": api_client["client_id"],
+            "original_name": resolved_name,
+            "mime_type": resolved_mime,
+            "size_bytes": int(size_bytes) if isinstance(size_bytes, int) and size_bytes >= 0 else None,
+            "source_url": normalized_url,
+            "delivery_mode": normalized_delivery_mode or "link_only",
+            "created_at": datetime.utcnow(),
+        }
+        media_files_collection.insert_one(doc)
+        return {
+            "file_id": file_id,
+            "url": normalized_url,
+            "name": resolved_name,
+            "mime_type": resolved_mime,
+            "size_bytes": doc["size_bytes"],
+            "delivery_mode": doc["delivery_mode"],
+            "storage": "remote_url",
+        }
+
+    original_name = file.filename or "upload.bin"
+    file_id = f"mf_{uuid.uuid4().hex[:12]}"
+    dest = MEDIA_DIR / file_id
+
+    size = 0
+    sha = hashlib.sha256()
+
+    with dest.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                try:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=413, detail=f"File too large. Max is {max_mb}MB.")
+            sha.update(chunk)
+            f.write(chunk)
+
+    mime_type = file.content_type or _guess_mime(original_name)
+    access_token = secrets.token_urlsafe(24)
+    doc = {
+        "file_id": file_id,
+        "client_id": api_client["client_id"],
+        "original_name": original_name,
+        "mime_type": mime_type,
+        "size_bytes": size,
+        "sha256": sha.hexdigest(),
+        "stored_path": str(dest),
+        "access_token": access_token,
+        "delivery_mode": normalized_delivery_mode or "auto",
+        "created_at": datetime.utcnow(),
+    }
+    media_files_collection.insert_one(doc)
+
+    return {
+        "file_id": file_id,
+        # Tokenized URL so external providers (SendGrid/UltraMsg) can fetch.
+        "url": _build_media_url(http_request, doc, include_token=True),
+        "name": original_name,
+        "mime_type": mime_type,
+        "size_bytes": size,
+        "delivery_mode": doc["delivery_mode"],
+        "storage": "local_file",
+    }
+
+
+@app.get("/media/{file_id}")
+def get_media(
+    file_id: str,
+    token: Optional[str] = Query(default=None),
+    api_client: Optional[dict] = Depends(verify_api_key_optional),
+):
+    doc = media_files_collection.find_one({"file_id": file_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="File not found")
+    # Allow either:
+    #  - authenticated access (dashboard / internal)
+    #  - tokenized public access (for providers fetching media URLs)
+    if api_client and doc.get("client_id") == api_client.get("client_id"):
+        allowed = True
+    else:
+        allowed = token and hmac.compare_digest(str(token), str(doc.get("access_token") or ""))
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if doc.get("source_url"):
+        return RedirectResponse(url=str(doc["source_url"]), status_code=307)
+    path = doc.get("stored_path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File missing on disk")
+    return FileResponse(
+        path,
+        media_type=doc.get("mime_type") or "application/octet-stream",
+        filename=doc.get("original_name") or file_id,
+    )
+
+
 @app.get("/jobs")
 def get_jobs(
     client_id: Optional[str] = None,
     channel: Optional[str] = None,
     status: Optional[str] = None,
+    event_type: Optional[str] = None,
+    job_id: Optional[str] = None,
     limit: int = 200,
     skip: int = 0,
 ):
@@ -1369,6 +2545,10 @@ def get_jobs(
         query["channel"] = channel
     if status:
         query["status"] = status
+    if event_type:
+        query["event_type"] = event_type
+    if job_id:
+        query["job_id"] = job_id
 
     total = notification_jobs_collection.count_documents(query)
     docs = list(
@@ -1385,13 +2565,233 @@ def get_jobs(
                 "status": 1,
                 "created_at": 1,
                 "updated_at": 1,
+                "recipients.recipient.user_id": 1,
             },
         )
         .sort("created_at", -1)
         .skip(skip)
         .limit(limit)
     )
+    # Add derived fields for UI convenience
+    job_ids = [d.get("job_id") for d in docs if d.get("job_id")]
+    latest_outcomes: dict[str, dict[str, dict]] = defaultdict(dict)
+    if job_ids:
+        log_docs = list(
+            delivery_logs_collection
+            .find(
+                {"job_id": {"$in": job_ids}},
+                {
+                    "_id": 0,
+                    "job_id": 1,
+                    "log_id": 1,
+                    "recipient_user_id": 1,
+                    "recipient_address": 1,
+                    "status": 1,
+                    "created_at": 1,
+                    "error": 1,
+                },
+            )
+            .sort("created_at", 1)
+        )
+        for log in log_docs:
+            jid = log.get("job_id")
+            if not jid:
+                continue
+            recipient_key = (
+                log.get("recipient_user_id")
+                or log.get("recipient_address")
+                or f"log:{log.get('log_id')}"
+            )
+            latest_outcomes[jid][recipient_key] = log
+
+    success_statuses = {"SENT", "DELIVERED", "READ"}
+    failed_statuses = {"FAILED", "DLQ", "DROPPED", "SPAM"}
+    for d in docs:
+        recs = d.get("recipients") or []
+        d["tasks"] = len(recs)
+        try:
+            d["user_ids"] = [r.get("recipient", {}).get("user_id") for r in recs if r.get("recipient", {}).get("user_id")]
+        except Exception:
+            d["user_ids"] = []
+        outcomes = latest_outcomes.get(d.get("job_id"), {})
+        succeeded_user_ids = []
+        failed_user_ids = []
+        latest_error = None
+        latest_log_time = None
+        latest_log_status = None
+        latest_ms = -1.0
+        for recipient_key, outcome in outcomes.items():
+            status_text = str(outcome.get("status") or "").upper()
+            user_id = outcome.get("recipient_user_id") or recipient_key
+            if status_text in success_statuses:
+                succeeded_user_ids.append(user_id)
+            elif status_text in failed_statuses:
+                failed_user_ids.append(user_id)
+            created_at = outcome.get("created_at")
+            try:
+                created_ms = created_at.timestamp() if hasattr(created_at, "timestamp") else 0
+            except Exception:
+                created_ms = 0
+            if created_ms >= latest_ms:
+                latest_ms = created_ms
+                latest_error = outcome.get("error")
+                latest_log_time = created_at
+                latest_log_status = outcome.get("status")
+
+        if not outcomes and str(d.get("status") or "").upper() in failed_statuses:
+            failed_user_ids = list(d.get("user_ids") or [])
+
+        d["succeeded_tasks"] = len(succeeded_user_ids)
+        d["failed_tasks"] = len(failed_user_ids)
+        d["succeeded_user_ids"] = succeeded_user_ids
+        d["failed_user_ids"] = failed_user_ids
+        d["latest_log_status"] = latest_log_status
+        d["latest_log_time"] = latest_log_time
+        d["latest_error"] = latest_error
     return {"total": total, "skip": skip, "limit": limit, "count": len(docs), "jobs": docs}
+
+
+# ── QUEUE ADMIN CONTROL ROUTES ────────────────────────────────────────────────
+
+@app.get("/queue-stats")
+def queue_stats(_: str = Depends(_require_bearer_token)):
+    """
+    Returns global + per-queue counts.
+    - waiting: RabbitMQ depth (queued messages)
+    - active:  Mongo jobs in PROCESSING
+    - failed:  Mongo jobs in DLQ (and DROPPED)
+    """
+    queues = list(CHANNELS)
+
+    # Mongo-side totals (fast aggregation by status)
+    global_total = notification_jobs_collection.count_documents({})
+    global_active = notification_jobs_collection.count_documents({"status": "PROCESSING"})
+    global_failed = notification_jobs_collection.count_documents({"status": {"$in": ["DLQ", "DROPPED"]}})
+
+    per_queue = []
+    global_waiting = 0
+    for ch in queues:
+        control = _get_or_init_queue_control(ch)
+        health = _primary_queue_health(ch) if QUEUE_FAILOVER_ENABLED else None
+        qname = _channel_to_queue_name(ch)
+        waiting = 0
+        backup_waiting = 0
+        active_queue = qname
+        try:
+            if health:
+                waiting = int(health["primary_stats"]["message_count"])
+                backup_waiting = int(health["backup_stats"]["message_count"])
+                active_queue = health.get("active_queue") or active_queue
+            else:
+                waiting = _rabbitmq_queue_depth(qname)
+        except Exception:
+            waiting = 0
+
+        active = notification_jobs_collection.count_documents({"channel": ch, "status": "PROCESSING"})
+        failed = notification_jobs_collection.count_documents({"channel": ch, "status": {"$in": ["DLQ", "DROPPED"]}})
+
+        global_waiting += waiting + backup_waiting
+        per_queue.append({
+            "type": ch.upper(),
+            "channel": ch,
+            "primary_queue": qname,
+            "backup_queue": (health["backup_queue"] if health else None),
+            "rate_limit": int((control or {}).get("rate_limit", 0) or 0),
+            "waiting": waiting,
+            "backup_waiting": backup_waiting,
+            "active": active,
+            "failed": failed,
+            "active_queue": active_queue,
+            "failover_reasons": (health.get("reasons") if health else []),
+            "backup_enabled": bool((health or {}).get("control", {}).get("backup_enabled", control.get("backup_enabled", True))),
+            "last_failover_reason": (health or {}).get("control", {}).get("last_failover_reason"),
+            "last_failover_at": (
+                ((health or {}).get("control", {}).get("last_failover_at").isoformat())
+                if hasattr((health or {}).get("control", {}).get("last_failover_at"), "isoformat")
+                else (health or {}).get("control", {}).get("last_failover_at")
+            ),
+        })
+
+    return {
+        "global": {
+            "total": global_total,
+            "waiting": global_waiting,
+            "active": global_active,
+            "failed": global_failed,
+        },
+        "queues": per_queue,
+    }
+
+
+@app.post("/pause-queue")
+def pause_queue(body: QueueControlBody, _: str = Depends(_require_bearer_token)):
+    channel = _normalize_channel(body.queue)
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {
+            "$set": {"paused": True, "updated_at": datetime.utcnow()},
+            "$setOnInsert": _safe_set_on_insert(_default_queue_control(channel), {"paused": True, "updated_at": datetime.utcnow()}),
+        },
+        upsert=True,
+    )
+    return {"message": f"{channel.upper()} paused"}
+
+
+@app.post("/resume-queue")
+def resume_queue(body: QueueControlBody, _: str = Depends(_require_bearer_token)):
+    channel = _normalize_channel(body.queue)
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {
+            "$set": {"paused": False, "updated_at": datetime.utcnow()},
+            "$setOnInsert": _safe_set_on_insert(_default_queue_control(channel), {"paused": False, "updated_at": datetime.utcnow()}),
+        },
+        upsert=True,
+    )
+    return {"message": f"{channel.upper()} resumed"}
+
+
+@app.post("/update-rate-limit")
+def update_rate_limit(body: QueueRateLimitBody, _: str = Depends(_require_bearer_token)):
+    channel = _normalize_channel(body.queue)
+    rate = int(body.rate)
+    if rate < 0:
+        raise HTTPException(status_code=400, detail="rate must be >= 0")
+    provider_cap_sec = _provider_cap_jobs_per_sec(channel)
+    provider_cap_min = max(0, int(provider_cap_sec * 60))
+    if provider_cap_min > 0 and rate > provider_cap_min:
+        raise HTTPException(
+            status_code=400,
+            detail=f"rate must be <= provider cap ({provider_cap_min} jobs/min) for channel '{channel}'",
+        )
+    queue_controls_collection.update_one(
+        {"channel": channel},
+        {
+            "$set": {"rate_limit": rate, "updated_at": datetime.utcnow()},
+            "$unset": {"rate limit": ""},  # legacy cleanup if present
+            "$setOnInsert": _safe_set_on_insert(_default_queue_control(channel), {"rate_limit": rate, "updated_at": datetime.utcnow()}),
+        },
+        upsert=True,
+    )
+    return {"message": f"{channel.upper()} rate limit updated to {rate} jobs/min"}
+
+
+@app.post("/clear-queue")
+def clear_queue(body: QueueControlBody, _: str = Depends(_require_bearer_token)):
+    channel = _normalize_channel(body.queue)
+    queue_name = _channel_to_queue_name(channel)
+    purged = 0
+    try:
+        purged = _purge_rabbitmq_queue(queue_name)
+    except Exception:
+        purged = 0
+    # Best-effort: mark queued jobs as CLEARED in Mongo so UI counts reconcile.
+    # (Celery broker messages are authoritative for "waiting".)
+    notification_jobs_collection.update_many(
+        {"channel": channel, "status": "QUEUED"},
+        {"$set": {"status": "CLEARED", "updated_at": datetime.utcnow()}},
+    )
+    return {"message": f"{channel.upper()} queue cleared", "tasks_removed": purged}
 
 
 # ── USER EVENT TYPES ROUTE ────────────────────────────────────────────────────
@@ -1429,6 +2829,7 @@ def get_logs(
     event_type: Optional[str] = None,
     channel:    Optional[str] = None,
     status:     Optional[str] = None,   # SENT | DELIVERED | READ | FAILED | SPAM
+    job_id:     Optional[str] = None,
     from_date:  Optional[str] = None,   # YYYY-MM-DD  (IST date)
     to_date:    Optional[str] = None,   # YYYY-MM-DD  (IST date)
     limit:      int           = 50,
@@ -1495,11 +2896,12 @@ def get_logs(
     if channel:    match["channel"]    = channel
     if status:     match["status"]     = status
     if event_type: match["event_type"] = event_type
+    if job_id:     match["job_id"]     = job_id
     if date_filter:
         match["created_at"] = date_filter
 
-    # user_id and client_id live on the joined job document
-    if user_id:   match["_job.recipient.user_id"] = user_id
+    # user_id lives on delivery_logs (per send); client_id lives on the joined job document
+    if user_id:   match["recipient_user_id"] = user_id
     if client_id: match["_job.client_id"]         = client_id
 
     if match:
@@ -1536,12 +2938,14 @@ def get_logs(
             "latency_ms":    1,
             "error":         1,
             "created_at":    1,
+            "recipient_user_id": 1,
+            "recipient_address": 1,
             # Nest the enriched job fields under a "job" key
             "job": {
                 "job_id":            "$_job.job_id",
                 "client_id":         "$_job.client_id",
-                "recipient_user_id": "$_job.recipient.user_id",
-                "recipient_address": "$_job.recipient_address",
+                "recipient_user_id": "$recipient_user_id",
+                "recipient_address": "$recipient_address",
                 "priority":          "$_job.priority",
                 "provider_history":  "$_job.provider_history",
             },
@@ -1700,6 +3104,137 @@ def get_stats(
     }
 
 
+@app.get("/latency")
+def get_latency_dashboard(
+    client_id:  Optional[str] = None,
+    event_type: Optional[str] = None,
+    channel:    Optional[str] = None,
+    from_date:  Optional[str] = None,
+    to_date:    Optional[str] = None,
+    sample_limit: int         = 5000,
+    _: str = Depends(_require_bearer_token),
+):
+    """
+    Latency dashboard for delivered notifications.
+
+    Latency definition:
+      latency_ms = delivered_at - sent_at (computed when provider webhooks arrive).
+
+    Returns:
+      - summary (count, avg, p50, p90, p99, min, max)
+      - per_channel breakdown with same metrics
+      - daily trend (avg + p90) by day for quick charts
+    """
+    sample_limit = min(max(int(sample_limit or 5000), 200), 20000)
+
+    # Base filters on delivery_logs fields
+    log_query: dict = {"latency_ms": {"$ne": None}}
+    if channel:
+        log_query["channel"] = channel
+    if event_type:
+        log_query["event_type"] = event_type
+    # Delivered-like statuses only
+    log_query["status"] = {"$in": ["DELIVERED", "READ"]}
+
+    if from_date or to_date:
+        date_filter: dict = {}
+        try:
+            if from_date:
+                date_filter["$gte"] = datetime.strptime(from_date, "%Y-%m-%d")
+            if to_date:
+                date_filter["$lte"] = datetime.strptime(to_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59
+                )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        log_query["created_at"] = date_filter
+
+    # We need client_id filter via join to notification_jobs
+    pipeline: list[dict] = [{"$match": log_query}]
+    if client_id:
+        pipeline += [
+            {
+                "$lookup": {
+                    "from": "notification_jobs",
+                    "localField": "job_id",
+                    "foreignField": "job_id",
+                    "as": "_job_docs",
+                }
+            },
+            {"$addFields": {"_job": {"$arrayElemAt": ["$_job_docs", 0]}}},
+            {"$match": {"_job.client_id": client_id}},
+        ]
+
+    # Grab a sample of latency rows for percentile calculations
+    pipeline_sample = pipeline + [
+        {"$project": {"_id": 0, "channel": 1, "latency_ms": 1, "created_at": 1}},
+        {"$sort": {"created_at": -1}},
+        {"$limit": sample_limit},
+    ]
+    rows = list(delivery_logs_collection.aggregate(pipeline_sample))
+
+    def compute_metrics(values: list[int]) -> dict:
+        if not values:
+            return {"count": 0, "avg_ms": None, "p50_ms": None, "p90_ms": None, "p99_ms": None, "min_ms": None, "max_ms": None}
+        vals = sorted(int(v) for v in values if v is not None)
+        if not vals:
+            return {"count": 0, "avg_ms": None, "p50_ms": None, "p90_ms": None, "p99_ms": None, "min_ms": None, "max_ms": None}
+        avg = round(sum(vals) / len(vals))
+        return {
+            "count": len(vals),
+            "avg_ms": avg,
+            "p50_ms": _percentile(vals, 50),
+            "p90_ms": _percentile(vals, 90),
+            "p99_ms": _percentile(vals, 99),
+            "min_ms": vals[0],
+            "max_ms": vals[-1],
+        }
+
+    all_vals = [r.get("latency_ms") for r in rows if r.get("latency_ms") is not None]
+    summary = compute_metrics(all_vals)
+
+    per_channel_map: dict[str, list[int]] = defaultdict(list)
+    per_day_map: dict[str, list[int]] = defaultdict(list)
+    for r in rows:
+        v = r.get("latency_ms")
+        if v is None:
+            continue
+        ch = (r.get("channel") or "unknown").lower()
+        per_channel_map[ch].append(int(v))
+        dt = r.get("created_at")
+        day_key = None
+        if hasattr(dt, "strftime"):
+            day_key = dt.strftime("%Y-%m-%d")
+        if day_key:
+            per_day_map[day_key].append(int(v))
+
+    per_channel = []
+    for ch, vals in sorted(per_channel_map.items(), key=lambda kv: kv[0]):
+        per_channel.append({"channel": ch, **compute_metrics(vals)})
+
+    trend = []
+    for day, vals in sorted(per_day_map.items(), key=lambda kv: kv[0]):
+        m = compute_metrics(vals)
+        trend.append({"day": day, "count": m["count"], "avg_ms": m["avg_ms"], "p90_ms": m["p90_ms"]})
+
+    return {
+        "filters_applied": {
+            k: v for k, v in {
+                "client_id": client_id,
+                "event_type": event_type,
+                "channel": channel,
+                "from_date": from_date,
+                "to_date": to_date,
+                "sample_limit": sample_limit,
+            }.items() if v
+        },
+        "summary": summary,
+        "per_channel": per_channel,
+        "trend": trend,
+        "note": "Percentiles are computed from a recent sample (sorted by created_at desc).",
+    }
+
+
 @app.get("/rate-limit-logs")
 def get_rate_limit_logs(
     user_id:   Optional[str] = None,
@@ -1811,6 +3346,225 @@ def get_dlq(
     return {"total": total, "skip": skip, "limit": limit, "count": len(docs), "dlq": docs}
 
 
+# ── DLQ ACTIONS (retry / discard / bulk operations) ───────────────────────────
+
+class JobActionBody(BaseModel):
+    job_id: str
+
+
+class DiscardDlqBody(BaseModel):
+    channel: Optional[str] = None
+
+
+def _requeue_job_from_dlq(job_id: str, *, countdown: int = 0, switch_provider: bool = False) -> dict:
+    """
+    Reconstructs a Celery job payload from notification_jobs + dlq entry and requeues it.
+    Returns metadata for UI.
+    """
+    original = notification_jobs_collection.find_one({"job_id": job_id}, {"_id": 0})
+    if not original:
+        raise HTTPException(status_code=404, detail=f"Original job not found: {job_id}")
+
+    dlq_doc = dlq_collection.find_one({"job_id": job_id}, {"_id": 0}) or {}
+
+    channel = original.get("channel") or dlq_doc.get("channel") or "email"
+    queue_name = _select_queue_for_dispatch(channel)
+
+    providers_snapshot = (
+        original.get("providers_snapshot")
+        or dlq_doc.get("providers_snapshot")
+        or _build_providers_snapshot(channel)
+    )
+    if not providers_snapshot:
+        raise HTTPException(status_code=400, detail="providers_snapshot missing — cannot requeue")
+
+    recipient_dict = original.get("recipient") or dlq_doc.get("recipient") or {}
+    recipient_address = original.get("recipient_address")
+    if not recipient_address:
+        # Fallback mapping (kept in sync with dlq_processor.py)
+        if channel == "email":
+            recipient_address = recipient_dict.get("email")
+        elif channel == "sms":
+            recipient_address = recipient_dict.get("phone")
+        elif channel == "whatsapp":
+            recipient_address = recipient_dict.get("wa_number")
+        elif channel == "push":
+            recipient_address = recipient_dict.get("fcm_token")
+
+    if not recipient_address:
+        raise HTTPException(status_code=400, detail=f"No recipient address for channel '{channel}'")
+
+    current_index = int((original.get("retry_meta") or {}).get("provider_index", 0))
+    if switch_provider:
+        current_index = min(current_index + 1, max(0, len(providers_snapshot) - 1))
+
+    new_job = {
+        "job_id":            job_id,
+        "request_id":        original.get("request_id"),
+        "client_id":         original.get("client_id"),
+        "event_type":        original.get("event_type"),
+        "channel":           channel,
+        "queue_name":        queue_name,
+        "recipient":         recipient_dict,
+        "recipient_address": recipient_address,
+        "content":           dlq_doc.get("payload") or original.get("content", {}),
+        "providers_snapshot": providers_snapshot,
+        "retry_meta": {
+            "attempt": 1,
+            "provider_index": current_index,
+        },
+        "provider_history":  dlq_doc.get("providers_tried") or original.get("provider_history") or [],
+        "created_at":        (original.get("created_at") or datetime.utcnow()).isoformat()
+                             if hasattr((original.get("created_at") or datetime.utcnow()), "isoformat")
+                             else original.get("created_at"),
+    }
+
+    send_notification.apply_async(args=[new_job], queue=queue_name, countdown=max(int(countdown or 0), 0))
+
+    # Mark both DLQ + job as queued again
+    dlq_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": "REQUEUED",
+            "requeued_at": datetime.utcnow(),
+        }, "$inc": {"requeue_count": 1}},
+        upsert=True,
+    )
+    notification_jobs_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": "QUEUED",
+            "queue_name": queue_name,
+            "queue_role": _queue_role(queue_name),
+            "retry_meta": new_job["retry_meta"],
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+
+    return {"job_id": job_id, "channel": channel, "queue_name": queue_name, "countdown": max(int(countdown or 0), 0)}
+
+
+@app.post("/retry-job")
+def retry_job(body: JobActionBody, _: str = Depends(_require_bearer_token)):
+    meta = _requeue_job_from_dlq(body.job_id, countdown=0)
+    return {"message": f"Job {body.job_id} requeued", **meta}
+
+
+@app.post("/discard-job")
+def discard_job(body: JobActionBody, _: str = Depends(_require_bearer_token)):
+    job_id = body.job_id
+    dlq_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "DROPPED", "dropped_at": datetime.utcnow(), "drop_reason": "Discarded from dashboard"}},
+        upsert=False,
+    )
+    notification_jobs_collection.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "DROPPED", "updated_at": datetime.utcnow()}},
+    )
+    return {"message": f"Job {job_id} discarded"}
+
+
+@app.post("/discard-dlq")
+def discard_dlq(body: DiscardDlqBody, _: str = Depends(_require_bearer_token)):
+    query: dict = {"status": "DLQ"}
+    channel = None
+    if body.channel:
+        channel = _normalize_channel(body.channel)
+        queue_name = _channel_to_queue_name(channel)
+        backup_queue_name = _channel_to_backup_queue_name(channel)
+        query["$or"] = [
+            {"channel": channel},
+            {"queue_name": {"$in": [queue_name, backup_queue_name]}},
+        ]
+
+    docs = list(dlq_collection.find(query, {"_id": 0, "job_id": 1}))
+    job_ids = [d.get("job_id") for d in docs if d.get("job_id")]
+    now = datetime.utcnow()
+
+    dlq_result = dlq_collection.update_many(
+        query,
+        {"$set": {"status": "DROPPED", "dropped_at": now, "drop_reason": "Bulk discarded from dashboard"}},
+    )
+    job_result = notification_jobs_collection.update_many(
+        {"job_id": {"$in": job_ids}},
+        {"$set": {"status": "DROPPED", "updated_at": now}},
+    ) if job_ids else None
+
+    scope = f" for {channel.upper()}" if channel else ""
+    return {
+        "message": f"Discarded {dlq_result.modified_count} DLQ job(s){scope}.",
+        "channel": channel,
+        "matched": dlq_result.matched_count,
+        "discarded": dlq_result.modified_count,
+        "jobs_updated": job_result.modified_count if job_result else 0,
+    }
+
+
+@app.post("/retry-failed")
+def retry_failed(_: str = Depends(_require_bearer_token), limit: int = 200):
+    """
+    Bulk retry for *transient* DLQ entries.
+    """
+    limit = min(max(int(limit), 1), 500)
+    docs = list(
+        dlq_collection.find(
+            {"status": "DLQ", "error_type": "TRANSIENT"},
+            {"_id": 0, "job_id": 1},
+        ).limit(limit)
+    )
+    requeued = []
+    failed = []
+    for d in docs:
+        jid = d.get("job_id")
+        if not jid:
+            continue
+        try:
+            requeued.append(_requeue_job_from_dlq(jid, countdown=0))
+        except Exception as e:
+            failed.append({"job_id": jid, "error": str(e)})
+    return {"message": "Retry failed processed", "attempted": len(docs), "requeued": len(requeued), "failures": failed}
+
+
+@app.post("/reprocess-dlq")
+def reprocess_dlq(_: str = Depends(_require_bearer_token), limit: int = 200):
+    """
+    Bulk reprocess DLQ entries (skips PERMANENT).
+    Respects next_retry_at if present by computing a countdown.
+    """
+    limit = min(max(int(limit), 1), 500)
+    docs = list(
+        dlq_collection.find(
+            {"status": "DLQ", "error_type": {"$ne": "PERMANENT"}},
+            {"_id": 0, "job_id": 1, "next_retry_at": 1, "error_code": 1},
+        ).limit(limit)
+    )
+    requeued = []
+    failed = []
+    now = datetime.utcnow()
+    for d in docs:
+        jid = d.get("job_id")
+        if not jid:
+            continue
+        countdown = 0
+        next_retry_at = d.get("next_retry_at")
+        if next_retry_at:
+            try:
+                # Mongo may return tz-aware; normalize to naive UTC
+                if getattr(next_retry_at, "tzinfo", None) is not None:
+                    next_retry_at = next_retry_at.replace(tzinfo=None)
+                countdown = max(0, int((next_retry_at - now).total_seconds()))
+            except Exception:
+                countdown = 0
+        # If SMTP timeout, switching provider often helps; mirror dlq_processor behavior.
+        switch = (d.get("error_code") == "SMTP_TIMEOUT")
+        try:
+            requeued.append(_requeue_job_from_dlq(jid, countdown=countdown, switch_provider=switch))
+        except Exception as e:
+            failed.append({"job_id": jid, "error": str(e)})
+    return {"message": "DLQ reprocess scheduled", "attempted": len(docs), "scheduled": len(requeued), "failures": failed}
+
+
 # ── PROVIDERS MANAGEMENT ENDPOINTS ────────────────────────────────────────────
 
 @app.get("/providers")
@@ -1838,6 +3592,13 @@ def upsert_provider(provider: dict):
     provider_id = provider.get("provider_id")
     if not provider_id:
         raise HTTPException(status_code=400, detail="provider_id is required")
+    provider_name = provider.get("provider_name")
+    if provider_name not in _SUPPORTED_PROVIDER_NAMES:
+        supported = ", ".join(sorted(_SUPPORTED_PROVIDER_NAMES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported provider_name '{provider_name}'. Supported providers: {supported}",
+        )
     providers_collection.update_one(
         {"provider_id": provider_id},
         {"$set": {**provider, "updated_at": datetime.utcnow() + timedelta(hours=5, minutes=30)}},
@@ -1913,6 +3674,146 @@ def verify_sendgrid_signature(payload: bytes, signature: str, timestamp: str) ->
     return hmac.compare_digest(expected, signature)
 
 
+def _message_id_candidates(raw_id) -> list[str]:
+    candidates: list[str] = []
+    if raw_id in (None, ""):
+        return candidates
+
+    text = str(raw_id).strip()
+    if not text:
+        return candidates
+
+    variants = [
+        text,
+        text.split(".")[0],
+        text.strip("<>"),
+    ]
+    if "." in text:
+        variants.append(text.strip("<>").split(".")[0])
+
+    seen = set()
+    for value in variants:
+        value = str(value).strip()
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+    return candidates
+
+
+def _recipient_value_candidates(raw_value) -> list[str]:
+    candidates: list[str] = []
+    if raw_value in (None, ""):
+        return candidates
+
+    text = str(raw_value).strip()
+    if not text:
+        return candidates
+
+    normalized = [text, text.lower()]
+    seen = set()
+    for value in normalized:
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+    return candidates
+
+
+def _event_nested_dicts(event: dict) -> list[dict]:
+    nested = [event]
+    for key in ("custom_args", "unique_args", "data", "message", "payload", "status", "value"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            nested.append(value)
+    return nested
+
+
+def _event_pick(event: dict, *keys: str):
+    for candidate in _event_nested_dicts(event):
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _find_delivery_log(
+    channel: Optional[str],
+    provider_message_id=None,
+    job_id=None,
+    provider_sid=None,
+    provider_hash=None,
+    recipient_user_id=None,
+    recipient_address=None,
+) -> Optional[dict]:
+    base_query = {}
+    if channel:
+        # Be tolerant of historical data where channel was stored as "EMAIL"/"WHATSAPP".
+        base_query["channel"] = {"$regex": f"^{re.escape(str(channel))}$", "$options": "i"}
+
+    id_filters = []
+    msg_candidates = _message_id_candidates(provider_message_id)
+    if msg_candidates:
+        id_filters.append({"provider_message_id": {"$in": msg_candidates}})
+
+    sid_candidates = _message_id_candidates(provider_sid)
+    if sid_candidates:
+        id_filters.append({"provider_message_sid": {"$in": sid_candidates}})
+
+    hash_candidates = _message_id_candidates(provider_hash)
+    if hash_candidates:
+        id_filters.append({"provider_message_hash": {"$in": hash_candidates}})
+
+    if id_filters:
+        query = dict(base_query)
+        query["$or"] = id_filters
+        doc = delivery_logs_collection.find_one(query, {"_id": 0}, sort=[("created_at", -1)])
+        if doc:
+            return doc
+
+    if not job_id:
+        return None
+
+    fallback_query = dict(base_query)
+    fallback_query["job_id"] = str(job_id)
+
+    recipient_user_candidates = _recipient_value_candidates(recipient_user_id)
+    if recipient_user_candidates:
+        fallback_query["recipient_user_id"] = {"$in": recipient_user_candidates}
+
+    recipient_address_candidates = _recipient_value_candidates(recipient_address)
+    if recipient_address_candidates:
+        fallback_query["recipient_address"] = {"$in": recipient_address_candidates}
+
+    docs = list(
+        delivery_logs_collection
+        .find(fallback_query, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(2)
+    )
+    if len(docs) == 1:
+        return docs[0]
+    if len(docs) > 1 and (recipient_user_candidates or recipient_address_candidates):
+        return docs[0]
+    return None
+
+
+def _compute_latency_ms(log: Optional[dict], event_time: datetime) -> Optional[int]:
+    if not log:
+        return None
+
+    sent_at = log.get("sent_at")
+    if not sent_at:
+        return None
+
+    try:
+        if getattr(sent_at, "tzinfo", None) is not None:
+            sent_at = sent_at.replace(tzinfo=None)
+        delta = event_time - sent_at
+        return max(0, int(delta.total_seconds() * 1000))
+    except Exception:
+        return None
+
+
 @app.post("/webhooks/sendgrid")
 async def sendgrid_webhook(request: Request):
     """
@@ -1942,74 +3843,97 @@ async def sendgrid_webhook(request: Request):
     for event in events:
         sg_event        = event.get("event", "")
         raw_msg_id      = event.get("sg_message_id", "")
-        provider_msg_id = raw_msg_id.split(".")[0] if raw_msg_id else None
+        provider_msg_id = _event_pick(event, "sg_message_id", "message_id", "messageId") or raw_msg_id or None
+        event_job_id    = _event_pick(event, "job_id", "_job_id")
+        event_user_id   = _event_pick(event, "recipient_user_id", "_recipient_user_id", "user_id")
+        event_address   = _event_pick(event, "recipient_address", "_recipient_address", "email")
         event_ts        = event.get("timestamp")
         now_ist         = datetime.utcnow() + timedelta(hours=5, minutes=30)
-
-        if not provider_msg_id:
-            skipped += 1
-            continue
 
         event_time = (
             datetime.utcfromtimestamp(event_ts) + timedelta(hours=5, minutes=30)
             if event_ts else now_ist
         )
 
-        if sg_event == "delivered":
-            log = delivery_logs_collection.find_one({"provider_message_id": provider_msg_id})
+        log = _find_delivery_log(
+            "email",
+            provider_message_id=provider_msg_id,
+            job_id=event_job_id,
+            recipient_user_id=event_user_id,
+            recipient_address=event_address,
+        )
+        if not log:
+            skipped += 1
+            continue
 
-            latency_ms = None
-            if log and log.get("sent_at"):
-                sent_at = log["sent_at"]
-                if hasattr(sent_at, "tzinfo") and sent_at.tzinfo is not None:
-                    sent_at = sent_at.replace(tzinfo=None)
-                delta      = event_time - sent_at
-                latency_ms = max(0, int(delta.total_seconds() * 1000))
+        update_filter = {"log_id": log["log_id"]}
+        sync_fields = {}
+        provider_candidates = _message_id_candidates(provider_msg_id)
+        if provider_candidates and log.get("provider_message_id") not in provider_candidates:
+            sync_fields["provider_message_id"] = provider_candidates[0]
+
+        if sg_event == "delivered":
+            latency_ms = _compute_latency_ms(log, event_time)
 
             delivery_logs_collection.update_one(
-                {"provider_message_id": provider_msg_id},
+                update_filter,
                 {"$set": {
                     "status":       "DELIVERED",
                     "delivered_at": event_time,
                     "latency_ms":   latency_ms,
+                    **sync_fields,
                 }},
             )
 
-            if log:
-                notification_jobs_collection.update_one(
-                    {"job_id": log["job_id"]},
-                    {"$set": {"status": "DELIVERED"}},
-                )
+            notification_jobs_collection.update_one(
+                {"job_id": log["job_id"]},
+                {"$set": {"status": "DELIVERED", "updated_at": now_ist}},
+            )
             processed += 1
 
         elif sg_event == "open":
+            update_doc = {
+                "status": "READ",
+                "read_at": event_time,
+                **sync_fields,
+            }
+            if not log.get("delivered_at"):
+                update_doc["delivered_at"] = event_time
+                update_doc["latency_ms"] = _compute_latency_ms(log, event_time)
             delivery_logs_collection.update_one(
-                {"provider_message_id": provider_msg_id},
-                {"$set": {"status": "READ", "read_at": event_time}},
+                update_filter,
+                {"$set": update_doc},
+            )
+            notification_jobs_collection.update_one(
+                {"job_id": log["job_id"]},
+                {"$set": {"status": "READ", "updated_at": now_ist}},
             )
             processed += 1
 
         elif sg_event == "bounce":
             bounce_reason = event.get("reason", "Bounced")
             delivery_logs_collection.update_one(
-                {"provider_message_id": provider_msg_id},
+                update_filter,
                 {"$set": {
                     "status": "FAILED",
                     "error":  {"message": f"Bounce: {bounce_reason}"},
+                    **sync_fields,
                 }},
             )
-            log = delivery_logs_collection.find_one({"provider_message_id": provider_msg_id})
-            if log:
-                notification_jobs_collection.update_one(
-                    {"job_id": log["job_id"]},
-                    {"$set": {"status": "FAILED"}},
-                )
+            notification_jobs_collection.update_one(
+                {"job_id": log["job_id"]},
+                {"$set": {"status": "FAILED", "updated_at": now_ist}},
+            )
             processed += 1
 
         elif sg_event == "spamreport":
             delivery_logs_collection.update_one(
-                {"provider_message_id": provider_msg_id},
-                {"$set": {"status": "SPAM"}},
+                update_filter,
+                {"$set": {"status": "SPAM", **sync_fields}},
+            )
+            notification_jobs_collection.update_one(
+                {"job_id": log["job_id"]},
+                {"$set": {"status": "SPAM", "updated_at": now_ist}},
             )
             processed += 1
 
@@ -2019,3 +3943,349 @@ async def sendgrid_webhook(request: Request):
     print(f"[WEBHOOK] SendGrid: {len(events)} event(s) — {processed} processed, {skipped} skipped")
 
     return {"received": len(events), "processed": processed, "skipped": skipped}
+
+
+# ── ULTRAMSG (WHATSAPP) WEBHOOK ───────────────────────────────────────────────
+#
+# UltraMsg can POST delivery/read events. Payload shapes vary; this endpoint
+# is intentionally tolerant and attempts to extract:
+#   - message id (provider_message_id)
+#   - status/event (delivered/read/failed/sent)
+#   - timestamp
+#
+# Optional verification:
+#   - set ULTRAMSG_WEBHOOK_TOKEN in .env and send header X-UltraMsg-Token
+#
+
+def _verify_ultramsg_webhook(request: Request) -> bool:
+    expected = os.getenv("ULTRAMSG_WEBHOOK_TOKEN")
+    if not expected:
+        return True  # local dev
+    got = request.headers.get("X-UltraMsg-Token", "")
+    return hmac.compare_digest(got, expected)
+
+
+def _extract_ultramsg_events(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [p for p in payload if isinstance(p, dict)]
+    if isinstance(payload, dict):
+        # Some providers wrap events
+        for key in ("events", "data", "messages", "statuses"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                return [p for p in v if isinstance(p, dict)]
+        return [payload]
+    return []
+
+
+def _ultramsg_nested_candidates(ev: dict) -> list[dict]:
+    candidates: list[dict] = [ev]
+    for key in ("data", "message", "payload", "status", "value"):
+        nested = ev.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    return candidates
+
+
+def _ultramsg_pick(ev: dict, *keys: str):
+    for candidate in _ultramsg_nested_candidates(ev):
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _ultramsg_canonical_status(ev: dict) -> Optional[str]:
+    raw_status = _ultramsg_pick(ev, "status", "event_type", "event", "type", "state", "messageStatus", "message_status")
+    if raw_status is not None:
+        status = str(raw_status).strip().lower()
+        if status in {"delivered", "deliver", "delivery"}:
+            return "DELIVERED"
+        if status in {"read", "seen", "opened", "open", "viewed"}:
+            return "READ"
+        if status in {"failed", "error", "undelivered"}:
+            return "FAILED"
+        if status in {"sent", "queued", "accepted"}:
+            return "SENT"
+        # UltraMsg webhook frequently uses event_type=message_ack with ack as a string.
+        if status in {"message_ack", "ack"}:
+            ack_val = _ultramsg_pick(ev, "ack")
+            if ack_val is not None:
+                ack_s = str(ack_val).strip().lower()
+                if ack_s in {"read", "seen"}:
+                    return "READ"
+                if ack_s in {"device", "delivered"}:
+                    return "DELIVERED"
+                if ack_s in {"server", "sent", "queued"}:
+                    return "SENT"
+
+    ack = _ultramsg_pick(ev, "ack")
+    if ack is not None:
+        try:
+            ack_num = int(str(ack).strip())
+        except Exception:
+            ack_num = None
+        if ack_num is not None:
+            if ack_num == 1:
+                return "SENT"
+            if ack_num == 2:
+                return "DELIVERED"
+            if ack_num >= 3:
+                return "READ"
+
+    return None
+
+
+@app.post("/webhooks/ultramsg")
+async def ultramsg_webhook(request: Request):
+    if not _verify_ultramsg_webhook(request):
+        raise HTTPException(status_code=403, detail="Invalid webhook token")
+
+    raw_body = await request.body()
+    # Store raw inbound webhook for debugging payload shape
+    try:
+        ultramsg_inbound_collection.insert_one({
+            "inbound_id": f"um_{uuid.uuid4().hex[:12]}",
+            "headers": dict(request.headers),
+            "raw_body": raw_body.decode("utf-8", errors="replace")[:20000],
+            "received_at": datetime.utcnow(),
+        })
+    except Exception:
+        pass
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8", errors="replace"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    events = _extract_ultramsg_events(payload)
+    processed = 0
+    skipped = 0
+
+    for ev in events:
+        # Try common id fields
+        provider_msg_id = (
+            _ultramsg_pick(
+                ev,
+                "id",
+                "message_id",
+                "msgid",
+                "messageId",
+                "messageID",
+                "wamid",
+                "sid",
+            )
+        )
+        provider_sid = _ultramsg_pick(ev, "sid")
+        provider_hash = _ultramsg_pick(ev, "hash")
+        event_job_id = _ultramsg_pick(ev, "job_id", "_job_id")
+        event_user_id = _ultramsg_pick(ev, "recipient_user_id", "_recipient_user_id", "user_id")
+        event_address = _ultramsg_pick(ev, "to", "chatId", "recipient_address", "_recipient_address", "wa_number", "phone")
+        ts = _ultramsg_pick(ev, "timestamp", "time", "ts", "created_at", "date")
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        event_time = now_ist
+        if ts is not None:
+            try:
+                # If numeric epoch seconds
+                if isinstance(ts, (int, float)) or (isinstance(ts, str) and ts.isdigit()):
+                    event_time = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=5, minutes=30)
+            except Exception:
+                event_time = now_ist
+
+        # Map provider status to our canonical status
+        canonical = _ultramsg_canonical_status(ev)
+        if not canonical:
+            skipped += 1
+            continue
+
+        log = _find_delivery_log(
+            "whatsapp",
+            provider_message_id=provider_msg_id,
+            job_id=event_job_id,
+            provider_sid=provider_sid,
+            provider_hash=provider_hash,
+            recipient_user_id=event_user_id,
+            recipient_address=event_address,
+        )
+        if not log:
+            skipped += 1
+            continue
+
+        update = {"status": canonical}
+        provider_candidates = _message_id_candidates(provider_msg_id)
+        if provider_candidates and log.get("provider_message_id") not in provider_candidates:
+            update["provider_message_id"] = provider_candidates[0]
+        sid_candidates = _message_id_candidates(provider_sid)
+        if sid_candidates and log.get("provider_message_sid") not in sid_candidates:
+            update["provider_message_sid"] = sid_candidates[0]
+        hash_candidates = _message_id_candidates(provider_hash)
+        if hash_candidates and log.get("provider_message_hash") not in hash_candidates:
+            update["provider_message_hash"] = hash_candidates[0]
+        if canonical == "DELIVERED":
+            update["delivered_at"] = event_time
+            update["latency_ms"] = _compute_latency_ms(log, event_time)
+        elif canonical == "READ":
+            update["read_at"] = event_time
+            if not log.get("delivered_at"):
+                update["delivered_at"] = event_time
+                update["latency_ms"] = _compute_latency_ms(log, event_time)
+        elif canonical == "FAILED":
+            update["error"] = {
+                "message": _ultramsg_pick(ev, "reason", "error", "description") or "WhatsApp delivery failed"
+            }
+
+        delivery_logs_collection.update_one(
+            {"log_id": log["log_id"]},
+            {"$set": update},
+        )
+
+        # Update job status for tracking/monitoring
+        notification_jobs_collection.update_one(
+            {"job_id": log.get("job_id")},
+            {"$set": {"status": canonical, "updated_at": now_ist}},
+        )
+
+        # Client webhook fan-out (best-effort)
+        _emit_client_webhook(
+            log.get("client_id"),
+            {
+                "type": "NOTIFICATION_STATUS",
+                "job_id": log.get("job_id"),
+                "client_id": log.get("client_id"),
+                "event_type": log.get("event_type"),
+                "channel": "whatsapp",
+                "status": canonical,
+                "provider": log.get("provider"),
+                "provider_message_id": provider_msg_id,
+                "timestamp": event_time.isoformat() if hasattr(event_time, "isoformat") else str(event_time),
+            },
+        )
+
+        processed += 1
+
+    print(f"[WEBHOOK] UltraMsg: {len(events)} event(s) — {processed} processed, {skipped} skipped")
+    return {"received": len(events), "processed": processed, "skipped": skipped}
+
+
+@app.get("/webhooks/ultramsg/latest")
+def ultramsg_latest(_: str = Depends(_require_bearer_token)):
+    """Debug endpoint: fetch the most recent inbound UltraMsg webhook payload."""
+    doc = ultramsg_inbound_collection.find_one({}, {"_id": 0}, sort=[("received_at", -1)])
+    if not doc:
+        return {"found": False}
+    return {"found": True, "latest": doc}
+
+# ── FAILURE ANALYTICS ROUTE ───────────────────────────────────────────────────
+
+@app.get("/failure-analytics")
+def get_failure_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """
+    Returns failure analytics for the dashboard:
+      - Total notifications dispatched in the date range
+      - Failure rate (%) and delivery rate (%)
+      - Per-event-type failure counts (for the table)
+
+    Query params:
+      start_date  ISO date string, e.g. 2026-04-25  (inclusive)
+      end_date    ISO date string, e.g. 2026-04-26  (inclusive, end of day)
+    """
+
+    # ── Build date filter ────────────────────────────────────────────────────
+    date_filter: dict = {}
+    try:
+        if start_date:
+            dt_start = datetime.strptime(start_date, "%Y-%m-%d")
+            date_filter["$gte"] = dt_start
+        if end_date:
+            dt_end = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59
+            )
+            date_filter["$lte"] = dt_end
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {exc}")
+
+    match_clause: dict = {}
+    if date_filter:
+        match_clause["created_at"] = date_filter
+
+    # ── Aggregate delivery_logs ──────────────────────────────────────────────
+    pipeline = [
+        {"$match": match_clause},
+        {
+            "$group": {
+                "_id": {
+                    "event_type": "$event_type",
+                    "status":     "$status",
+                },
+                "count": {"$sum": 1},
+            }
+        },
+        {
+            "$group": {
+                "_id":    "$_id.event_type",
+                "totals": {
+                    "$push": {
+                        "status": "$_id.status",
+                        "count":  "$count",
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id":        0,
+                "event_type": "$_id",
+                "totals":     1,
+            }
+        },
+        {"$sort": {"event_type": 1}},
+    ]
+
+    results = list(delivery_logs_collection.aggregate(pipeline))
+
+    # ── Reshape into per-event-type summary ──────────────────────────────────
+    rows = []
+    grand_total    = 0
+    grand_failures = 0
+
+    for doc in results:
+        event_type = doc.get("event_type") or "UNKNOWN"
+        sent   = 0
+        failed = 0
+        for t in doc.get("totals", []):
+            if t["status"] == "SENT":
+                sent += t["count"]
+            elif t["status"] == "FAILED":
+                failed += t["count"]
+
+        total = sent + failed
+        grand_total    += total
+        grand_failures += failed
+
+        if total > 0:
+            rows.append({
+                "event_type":    event_type,
+                "total":         total,
+                "sent":          sent,
+                "failures":      failed,
+                "failure_rate":  round(failed / total * 100, 2),
+                "delivery_rate": round(sent   / total * 100, 2),
+            })
+
+    # ── Grand totals ─────────────────────────────────────────────────────────
+    grand_sent          = grand_total - grand_failures
+    grand_failure_rate  = round(grand_failures / grand_total * 100, 2) if grand_total else 0.0
+    grand_delivery_rate = round(grand_sent     / grand_total * 100, 2) if grand_total else 0.0
+
+    return {
+        "total":         grand_total,
+        "sent":          grand_sent,
+        "failures":      grand_failures,
+        "failure_rate":  grand_failure_rate,
+        "delivery_rate": grand_delivery_rate,
+        "by_event_type": rows,
+    }
