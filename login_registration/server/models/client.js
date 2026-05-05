@@ -5,7 +5,13 @@ const EventTokenSchema = new mongoose.Schema({
     api_key_hash: String,
     is_active: Boolean,
     created_at: Date,
-    expires_at: Date
+    expires_at: Date,
+    last_refreshed_at: Date,
+    next_refresh_at: Date,
+    auto_refresh_enabled: {
+        type: Boolean,
+        default: true
+    }
 }, { _id: false });
 
 const ClientSchema = new mongoose.Schema({

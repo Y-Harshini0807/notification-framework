@@ -7,13 +7,15 @@ const jwt = require("jsonwebtoken")
 const crypto = require("crypto")
 const JWT_SECRET   = "your_secret_key"
 const FASTAPI_URL  = process.env.FASTAPI_URL || "http://localhost:8000"
+const MONGO_URL    = process.env.MONGO_URL || "mongodb://localhost:27017/notification_db"
 const EmployeeModel = require("./models/client")
+const TOKEN_REFRESH_INTERVAL_MONTHS = 1
 
 const app = express()
 app.use(express.json())
 app.use(cors())
 
-mongoose.connect("mongodb://localhost:27017/notification_db")
+mongoose.connect(MONGO_URL)
 
 // -------------------- Utility Functions --------------------
 function generateClientId() {
@@ -27,6 +29,107 @@ function generateApiKey() {
 
 function normalizeEventType(value) {
     return String(value || "").trim().toUpperCase()
+}
+
+function addMonths(date, months = TOKEN_REFRESH_INTERVAL_MONTHS) {
+    const base = date instanceof Date ? new Date(date) : new Date(date || Date.now())
+    const day = base.getDate()
+    base.setMonth(base.getMonth() + months)
+
+    if (base.getDate() !== day) {
+        base.setDate(0)
+    }
+    return base
+}
+
+function getTokenNextRefreshDate(token) {
+    return token.next_refresh_at || token.expires_at || addMonths(token.created_at || Date.now())
+}
+
+async function syncPlainApiKeyToFastApi(user, rawKey, eventType, action = "token") {
+    try {
+        await axios.post(`${FASTAPI_URL}/clients/sync`, {
+            client_id:        user.client_id,
+            name:             user.client_name || user.name,
+            plain_api_key:    rawKey,
+            event_type:       eventType,
+            allowed_channels: ["email", "sms", "whatsapp", "push"],
+            monthly_quota:    user.monthly_quota || 10000000,
+        })
+        console.log(`[SYNC] ${action} -> FastAPI for ${user.client_id}`)
+        return { synced: true }
+    } catch (syncErr) {
+        console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message)
+        return { synced: false, error: syncErr.message }
+    }
+}
+
+async function rotateEventToken(user, eventType, reason = "manual") {
+    const normalizedEvent = normalizeEventType(eventType)
+    const rawKey = generateApiKey()
+    const hash = await bcrypt.hash(rawKey, 10)
+    const refreshedAt = new Date()
+    const nextRefreshAt = addMonths(refreshedAt)
+
+    const result = await EmployeeModel.updateOne(
+        {
+            email: user.email,
+            "event_tokens.event_type": normalizedEvent
+        },
+        {
+            $set: {
+                "event_tokens.$.api_key_hash": hash,
+                "event_tokens.$.created_at": refreshedAt,
+                "event_tokens.$.last_refreshed_at": refreshedAt,
+                "event_tokens.$.next_refresh_at": nextRefreshAt,
+                "event_tokens.$.expires_at": nextRefreshAt,
+                "event_tokens.$.is_active": true,
+                "event_tokens.$.auto_refresh_enabled": true
+            }
+        }
+    )
+
+    if (result.matchedCount === 0) {
+        return null
+    }
+
+    const sync = await syncPlainApiKeyToFastApi(user, rawKey, normalizedEvent, `${reason}-refresh-token`)
+    return {
+        event_type: normalizedEvent,
+        api_key: rawKey,
+        refreshed_at: refreshedAt,
+        next_refresh_at: nextRefreshAt,
+        auto_refreshed: reason === "auto",
+        fastapi_synced: sync.synced,
+    }
+}
+
+async function autoRefreshDueTokens(user) {
+    const now = new Date()
+    const dueTokens = (user.event_tokens || []).filter((token) => {
+        if (!token || token.is_active === false || token.auto_refresh_enabled === false) return false
+        return getTokenNextRefreshDate(token) <= now
+    })
+
+    const refreshed = []
+    for (const token of dueTokens) {
+        const rotated = await rotateEventToken(user, token.event_type, "auto")
+        if (rotated) refreshed.push(rotated)
+    }
+    return refreshed
+}
+
+function serializeEventToken(token) {
+    const nextRefreshAt = getTokenNextRefreshDate(token)
+    return {
+        event_type: token.event_type,
+        is_active: token.is_active,
+        created_at: token.created_at,
+        last_refreshed_at: token.last_refreshed_at || token.created_at,
+        next_refresh_at: nextRefreshAt,
+        expires_at: nextRefreshAt,
+        auto_refresh_enabled: token.auto_refresh_enabled !== false,
+    }
 }
 
 // -------------------- Middleware --------------------
@@ -65,6 +168,8 @@ app.post("/register", async (req, res) => {
 
         const rawApiKey = generateApiKey();
         const hashedKey = await bcrypt.hash(rawApiKey, 10);
+        const tokenCreatedAt = new Date();
+        const tokenNextRefreshAt = addMonths(tokenCreatedAt);
 
         const company = await EmployeeModel.create({
             name,
@@ -77,7 +182,11 @@ app.post("/register", async (req, res) => {
                     event_type: "DEFAULT",
                     api_key_hash: hashedKey,
                     is_active: true,
-                    created_at: new Date()
+                    created_at: tokenCreatedAt,
+                    last_refreshed_at: tokenCreatedAt,
+                    next_refresh_at: tokenNextRefreshAt,
+                    expires_at: tokenNextRefreshAt,
+                    auto_refresh_enabled: true
                 }
             ]
         });
@@ -169,15 +278,19 @@ app.post("/login", async (req, res) => {
 app.get("/home", authenticate, async (req, res) => {
     try {
         const user = await EmployeeModel.findOne({ email: req.user.email })
+        if (!user) {
+            return res.status(404).json({ message: "User not found" })
+        }
+        const autoRefreshedTokens = await autoRefreshDueTokens(user)
+        const freshUser = autoRefreshedTokens.length
+            ? await EmployeeModel.findOne({ email: req.user.email })
+            : user
         res.json({
-            client_id: user.client_id,
-            event_tokens: user.event_tokens.map(t => ({
-                event_type: t.event_type,
-                is_active: t.is_active,
-                created_at: t.created_at
-            })),
-            monthly_quota: user.monthly_quota,
-            quota_used: user.quota_used
+            client_id: freshUser.client_id,
+            event_tokens: freshUser.event_tokens.map(serializeEventToken),
+            auto_refreshed_tokens: autoRefreshedTokens,
+            monthly_quota: freshUser.monthly_quota,
+            quota_used: freshUser.quota_used
         })
     } catch (err) {
         console.error("HOME ERROR:", err)  
@@ -204,6 +317,8 @@ app.post("/create-token", authenticate, async (req, res) => {
         }
         const rawKey = generateApiKey()
         const hash = await bcrypt.hash(rawKey, 10)
+        const createdAt = new Date()
+        const nextRefreshAt = addMonths(createdAt)
         await EmployeeModel.updateOne(
             { email: req.user.email },
             {
@@ -212,30 +327,22 @@ app.post("/create-token", authenticate, async (req, res) => {
                         event_type: eventType,
                         api_key_hash: hash,
                         is_active: true,
-                        created_at: new Date(),
-                        expires_at: null
+                        created_at: createdAt,
+                        last_refreshed_at: createdAt,
+                        next_refresh_at: nextRefreshAt,
+                        expires_at: nextRefreshAt,
+                        auto_refresh_enabled: true
                     }
                 }
             }
         )
         const user = await EmployeeModel.findOne({ email: req.user.email })
-        try {
-            await axios.post(`${FASTAPI_URL}/clients/sync`, {
-                client_id:        user.client_id,
-                name:             user.client_name || user.name,
-                plain_api_key:    rawKey,
-                event_type:       eventType,
-                allowed_channels: ["email", "sms", "whatsapp", "push"],
-                monthly_quota:    user.monthly_quota || 10000000,
-            })
-            console.log(`[SYNC] create-token → FastAPI for ${user.client_id}`)
-        } catch (syncErr) {
-            console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message)
-        }
+        await syncPlainApiKeyToFastApi(user, rawKey, eventType, "create-token")
         res.json({
             message: "Token created",
             event_type: eventType,
-            api_key: rawKey   // ⚠️ show only once
+            api_key: rawKey,   // ⚠️ show only once
+            next_refresh_at: nextRefreshAt
         })
     } catch (err) {
         res.status(500).json({ message: "Server error" })
@@ -249,43 +356,17 @@ app.post("/refresh-token", authenticate, async (req, res) => {
         if (!eventType) {
             return res.status(400).json({ message: "event_type required" })
         }
-        const rawKey = generateApiKey()
-        const hash = await bcrypt.hash(rawKey, 10)
-
-        const result = await EmployeeModel.updateOne(
-            {
-                email: req.user.email,
-                "event_tokens.event_type": eventType
-            },
-            {
-                $set: {
-                    "event_tokens.$.api_key_hash": hash,
-                    "event_tokens.$.created_at": new Date(),
-                    "event_tokens.$.is_active": true
-                }
-            }
-        )
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ message: `No token found for event_type ${eventType}` })
-        }
         const user = await EmployeeModel.findOne({ email: req.user.email })
-        try {
-            await axios.post(`${FASTAPI_URL}/clients/sync`, {
-                client_id:        user.client_id,
-                name:             user.client_name || user.name,
-                plain_api_key:    rawKey,
-                event_type:       eventType,
-                allowed_channels: ["email", "sms", "whatsapp", "push"],
-                monthly_quota:    user.monthly_quota || 10000000,
-            })
-            console.log(`[SYNC] refresh-token → FastAPI for ${user.client_id}`)
-        } catch (syncErr) {
-            console.warn("[SYNC] FastAPI sync failed (non-fatal):", syncErr.message)
+        if (!user) {
+            return res.status(404).json({ message: "User not found" })
+        }
+        const refreshed = await rotateEventToken(user, eventType, "manual")
+        if (!refreshed) {
+            return res.status(404).json({ message: `No token found for event_type ${eventType}` })
         }
         res.json({
             message: "Token refreshed",
-            event_type: eventType,
-            api_key: rawKey
+            ...refreshed
         })
     } catch (err) {
         res.status(500).json({ message: "Server error" })
@@ -396,11 +477,23 @@ app.post("/generate-api-key", authenticate, async (req, res) => {
 
         const newRawKey = generateApiKey();            // nf_<64hex>
         const newHash   = await bcrypt.hash(newRawKey, 10);
+        const refreshedAt = new Date();
+        const nextRefreshAt = addMonths(refreshedAt);
 
         // Store hash in Node.js DB (replace DEFAULT token or add fresh one)
         await EmployeeModel.updateOne(
             { email: req.user.email, "event_tokens.event_type": "DEFAULT" },
-            { $set: { "event_tokens.$.api_key_hash": newHash, "event_tokens.$.created_at": new Date() } }
+            {
+                $set: {
+                    "event_tokens.$.api_key_hash": newHash,
+                    "event_tokens.$.created_at": refreshedAt,
+                    "event_tokens.$.last_refreshed_at": refreshedAt,
+                    "event_tokens.$.next_refresh_at": nextRefreshAt,
+                    "event_tokens.$.expires_at": nextRefreshAt,
+                    "event_tokens.$.is_active": true,
+                    "event_tokens.$.auto_refresh_enabled": true,
+                }
+            }
         );
 
         // Sync the new key to FastAPI by calling /clients/sync directly.
@@ -419,6 +512,7 @@ app.post("/generate-api-key", authenticate, async (req, res) => {
             message: "API key regenerated. Save it now — shown only once.",
             client_id: user.client_id,
             api_key:   newRawKey,
+            next_refresh_at: nextRefreshAt,
         });
     } catch (err) {
         res.status(500).json({ message: "Server error: " + err.message });

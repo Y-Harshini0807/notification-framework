@@ -8,6 +8,7 @@ function Home() {
     const [clientId, setClientId] = useState("")
     const [tokens, setTokens] = useState([])
     const [tokenApiKeys, setTokenApiKeys] = useState({})
+    const [autoRefreshNotice, setAutoRefreshNotice] = useState(null)
     const [newEvent, setNewEvent] = useState("")
     const [newApiKey, setNewApiKey] = useState("")
     const [loading, setLoading] = useState(true)
@@ -114,6 +115,16 @@ function Home() {
         if (Number.isNaN(date.getTime())) return String(value)
         return date.toLocaleString()
     }
+    const formatTokenTimestamp = (value) => {
+        if (!value) return "-"
+        const date = new Date(value)
+        if (Number.isNaN(date.getTime())) return String(value)
+        return date.toLocaleDateString(undefined, {
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+        })
+    }
     const renderFailoverReasons = (reasons) => {
         const rows = Array.isArray(reasons) ? reasons.filter(Boolean) : []
         if (!rows.length) return "Healthy"
@@ -134,6 +145,8 @@ function Home() {
         open: false,
         eventType: "",
         apiKey: "",
+        isAutoRefresh: false,
+        autoRefreshedTokens: [],
     })
     const viewJob = (job) => {
         setSelectedJob(job)
@@ -228,16 +241,43 @@ function Home() {
             const fetchedClientId = res.data.client_id
             setClientId(fetchedClientId)
             setTokens(toSafeObjectArray(res.data?.event_tokens))
+            const autoRefreshedTokens = toSafeObjectArray(res.data?.auto_refreshed_tokens)
             const storedTokenKeys = localStorage.getItem(`tokenApiKeys_${fetchedClientId}`)
+            let currentTokenKeys = {}
             if (storedTokenKeys) {
                 try {
-                    setTokenApiKeys(JSON.parse(storedTokenKeys))
+                    const parsedTokenKeys = JSON.parse(storedTokenKeys)
+                    currentTokenKeys = parsedTokenKeys && typeof parsedTokenKeys === "object" && !Array.isArray(parsedTokenKeys)
+                        ? parsedTokenKeys
+                        : {}
                 } catch {
                     // Prevent malformed local storage from crashing the dashboard render.
-                    setTokenApiKeys({})
+                    currentTokenKeys = {}
                 }
-            } else {
-                setTokenApiKeys({})
+            }
+            const refreshedKeyEntries = autoRefreshedTokens
+                .filter((token) => token.event_type && token.api_key)
+                .map((token) => [String(token.event_type).trim().toUpperCase(), token.api_key])
+            const mergedTokenKeys = refreshedKeyEntries.length
+                ? { ...currentTokenKeys, ...Object.fromEntries(refreshedKeyEntries) }
+                : currentTokenKeys
+            setTokenApiKeys(mergedTokenKeys)
+            localStorage.setItem(`tokenApiKeys_${fetchedClientId}`, JSON.stringify(mergedTokenKeys))
+            if (autoRefreshedTokens.length) {
+                const firstRefreshed = autoRefreshedTokens[0]
+                setAutoRefreshNotice({
+                    count: autoRefreshedTokens.length,
+                    eventTypes: autoRefreshedTokens.map((token) => token.event_type).filter(Boolean),
+                    refreshedAt: firstRefreshed.refreshed_at,
+                    hasSyncErrors: autoRefreshedTokens.some((token) => token.fastapi_synced === false),
+                })
+                setTokenModal({
+                    open: true,
+                    eventType: autoRefreshedTokens.map((token) => token.event_type).filter(Boolean).join(", "),
+                    apiKey: firstRefreshed.api_key,
+                    isAutoRefresh: true,
+                    autoRefreshedTokens,
+                })
             }
 
         } catch (err) {
@@ -264,6 +304,8 @@ function Home() {
         }
         fetchData()
         fetchQueueStats()
+        const tokenRefreshCheckId = setInterval(fetchData, 6 * 60 * 60 * 1000)
+        return () => clearInterval(tokenRefreshCheckId)
     }, [])
     useEffect(() => {
         if (activeTab !== "stats") return
@@ -326,6 +368,8 @@ function Home() {
                 open: true,
                 eventType: res.data.event_type || newEvent.trim().toUpperCase(),
                 apiKey: res.data.api_key,
+                isAutoRefresh: false,
+                autoRefreshedTokens: [],
             })
             setNewEvent("")
             fetchData()
@@ -346,10 +390,13 @@ function Home() {
                 open: true,
                 eventType: res.data.event_type || event_type,
                 apiKey: res.data.api_key,
+                isAutoRefresh: false,
+                autoRefreshedTokens: [],
             })
+            fetchData()
 
         } catch (err) {
-            alert("Failed to refresh token")
+            alert(err.response?.data?.message || "Failed to refresh token")
         }
     }
 
@@ -924,17 +971,15 @@ function Home() {
                 Failure Analytics
             </div>
 
-            <button
-                type="button"
+            <div 
                 className={`sidebar-item ${activeTab === "webhooks" ? "active" : ""}`}
                 onClick={() => {
                     handleTabChange("webhooks")
                     fetchWebhookLogs()
                 }}
-                style={{ width: "100%", textAlign: "left", border: "none", color: "inherit", background: "transparent" }}
             >
                 Webhook Logs
-            </button>
+            </div>
 
             <div className={`sidebar-item ${activeTab === "clients" ? "active" : ""}`} onClick={() => handleTabChange("clients")} >
                 Client Monitor
@@ -1517,11 +1562,30 @@ function Home() {
                         />
                         <button onClick={createToken}>Create Token</button>
                     </div>
+                    {autoRefreshNotice && (
+                        <div
+                            style={{
+                                background: autoRefreshNotice.hasSyncErrors ? "#fffbeb" : "#ecfdf5",
+                                border: `1px solid ${autoRefreshNotice.hasSyncErrors ? "#fcd34d" : "#86efac"}`,
+                                color: autoRefreshNotice.hasSyncErrors ? "#92400e" : "#166534",
+                                borderRadius: "8px",
+                                padding: "10px 12px",
+                                marginBottom: "12px",
+                            }}
+                        >
+                            Auto refresh completed for {autoRefreshNotice.eventTypes.join(", ")} on{" "}
+                            {formatTokenTimestamp(autoRefreshNotice.refreshedAt)}. The new API key
+                            {autoRefreshNotice.count > 1 ? "s are" : " is"} saved in this browser and shown in the popup once.
+                            {autoRefreshNotice.hasSyncErrors && " FastAPI sync failed for at least one token, so re-sync before using that key with /notify."}
+                        </div>
+                    )}
                     <table>
                         <thead>
                             <tr>
                                 <th>Event Type</th>
                                 <th>Status</th>
+                                <th>Last Refreshed</th>
+                                <th>Next Auto Refresh</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -1540,6 +1604,8 @@ function Home() {
                                             {t.is_active ? "Active" : "Disabled"}
                                         </span>
                                     </td>
+                                    <td>{formatTokenTimestamp(t.last_refreshed_at || t.created_at)}</td>
+                                    <td>{t.auto_refresh_enabled === false ? "Off" : formatTokenTimestamp(t.next_refresh_at || t.expires_at)}</td>
 
                                     <td>
                                         <button
@@ -2322,37 +2388,87 @@ function Home() {
                         color: "#e2e8f0",
                     }}
                 >
-                    <h3 style={{ marginTop: 0, marginBottom: "10px" }}>New API Key Generated</h3>
+                    <h3 style={{ marginTop: 0, marginBottom: "10px" }}>
+                        {tokenModal.isAutoRefresh ? "API Key Auto Refreshed" : "New API Key Generated"}
+                    </h3>
                     <p style={{ marginTop: 0, marginBottom: "12px", color: "#94a3b8", fontSize: "14px" }}>
                         Event Type: <strong style={{ color: "#f8fafc" }}>{tokenModal.eventType}</strong>
                     </p>
                     <p style={{ marginTop: 0, marginBottom: "14px", color: "#fca5a5", fontSize: "13px" }}>
-                        Save this key now. It is shown only once.
+                        {tokenModal.isAutoRefresh
+                            ? "This refreshed key has been saved in this browser. Copy it now for any external systems that call /notify."
+                            : "Save this key now. It is shown only once."}
                     </p>
-                    <input
-                        type="text"
-                        readOnly
-                        value={tokenModal.apiKey}
-                        style={{
-                            width: "100%",
-                            background: "#020617",
-                            border: "1px solid #334155",
-                            color: "#7dd3fc",
-                            borderRadius: "8px",
-                            padding: "10px 12px",
-                            fontFamily: "monospace",
-                            marginBottom: "14px",
-                        }}
-                    />
+                    {tokenModal.isAutoRefresh && tokenModal.autoRefreshedTokens.length > 0 ? (
+                        <div style={{ display: "grid", gap: "10px", marginBottom: "14px" }}>
+                            {tokenModal.autoRefreshedTokens.map((token) => {
+                                const copyTarget = `auto-refreshed-token-${token.event_type}`
+                                return (
+                                    <div
+                                        key={token.event_type}
+                                        style={{
+                                            display: "grid",
+                                            gridTemplateColumns: "minmax(88px, auto) 1fr auto",
+                                            gap: "8px",
+                                            alignItems: "center",
+                                        }}
+                                    >
+                                        <strong style={{ color: "#f8fafc", fontSize: "13px" }}>
+                                            {token.event_type}
+                                        </strong>
+                                        <input
+                                            type="text"
+                                            readOnly
+                                            value={token.api_key}
+                                            style={{
+                                                width: "100%",
+                                                minWidth: 0,
+                                                background: "#020617",
+                                                border: "1px solid #334155",
+                                                color: "#7dd3fc",
+                                                borderRadius: "8px",
+                                                padding: "10px 12px",
+                                                fontFamily: "monospace",
+                                            }}
+                                        />
+                                        <button
+                                            onClick={() => copyToClipboard(token.api_key, copyTarget)}
+                                            style={{ background: "#2563eb", color: "#fff", whiteSpace: "nowrap" }}
+                                        >
+                                            {copiedTarget === copyTarget ? "Copied" : "Copy Auto Refreshed Token"}
+                                        </button>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                    ) : (
+                        <input
+                            type="text"
+                            readOnly
+                            value={tokenModal.apiKey}
+                            style={{
+                                width: "100%",
+                                background: "#020617",
+                                border: "1px solid #334155",
+                                color: "#7dd3fc",
+                                borderRadius: "8px",
+                                padding: "10px 12px",
+                                fontFamily: "monospace",
+                                marginBottom: "14px",
+                            }}
+                        />
+                    )}
                     <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+                        {!tokenModal.isAutoRefresh && (
+                            <button
+                                onClick={() => copyToClipboard(tokenModal.apiKey, "token-modal-key")}
+                                style={{ background: "#2563eb", color: "#fff" }}
+                            >
+                                {copiedTarget === "token-modal-key" ? "✓" : "Copy Key"}
+                            </button>
+                        )}
                         <button
-                            onClick={() => copyToClipboard(tokenModal.apiKey, "token-modal-key")}
-                            style={{ background: "#2563eb", color: "#fff" }}
-                        >
-                            {copiedTarget === "token-modal-key" ? "✓" : "Copy Key"}
-                        </button>
-                        <button
-                            onClick={() => setTokenModal({ open: false, eventType: "", apiKey: "" })}
+                            onClick={() => setTokenModal({ open: false, eventType: "", apiKey: "", isAutoRefresh: false, autoRefreshedTokens: [] })}
                             style={{ background: "#334155", color: "#fff" }}
                         >
                             Close

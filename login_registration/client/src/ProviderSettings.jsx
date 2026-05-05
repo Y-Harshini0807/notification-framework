@@ -18,7 +18,8 @@ const AVAILABLE_PROVIDERS = {
     { provider_id: "smtp",        provider_name: "SMTP",        description: "Direct mail server" },
   ],
   sms:      [
-    { provider_id: "sendfire",    provider_name: "SendFire",    description: "SMS gateway" },
+    { provider_id: "twilio",      provider_name: "Twilio",      description: "Programmable SMS" },
+    { provider_id: "sendfire",    provider_name: "SendFire",    description: "Legacy SMS gateway" },
   ],
   whatsapp: [
     { provider_id: "ultramsg",    provider_name: "UltraMsg",    description: "WhatsApp API service" },

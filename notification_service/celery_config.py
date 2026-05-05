@@ -1,9 +1,10 @@
+import os
 from celery import Celery
 from kombu import Queue, Exchange
 
 celery_app = Celery(
     "tasks",
-    broker="amqp://guest:guest@localhost:5672//",
+    broker=os.getenv("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//"),
     # Use JSON serialiser so job dicts (with ISO datetime strings) travel safely
     task_serializer="json",
     accept_content=["json"],

@@ -10,5 +10,9 @@ queue_control = {
     "whatsapp": {
         "paused": False,
         "rate_limit": 50
+    },
+    "push": {
+        "paused": False,
+        "rate_limit": 50
     }
 }

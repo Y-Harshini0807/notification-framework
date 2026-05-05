@@ -27,7 +27,7 @@ from fastapi.responses import RedirectResponse
 from celery_config import celery_app
 from tasks import send_notification
 from dlq_processor import run_worker
-from kombu import Connection
+from kombu import Connection, Queue
 import requests as http_requests
 
 load_dotenv()
@@ -67,6 +67,13 @@ MEDIA_DIR = Path(os.getenv("MEDIA_DIR", os.path.join(os.path.dirname(__file__), 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET", "")
+MEDIA_URL_TTL_DAYS = max(1, int(os.getenv("MEDIA_URL_TTL_DAYS", "30")))
+ALLOW_PRIVATE_MEDIA_URLS = str(os.getenv("ALLOW_PRIVATE_MEDIA_URLS", "0")).strip().lower() in {"1", "true", "yes"}
+ALLOWED_PRIVATE_MEDIA_HOSTS = {
+    h.strip().lower()
+    for h in (os.getenv("ALLOWED_PRIVATE_MEDIA_HOSTS", "") or "").split(",")
+    if h.strip()
+}
 CHANNELS = ("email", "sms", "whatsapp", "push")
 QUEUE_FAILOVER_ENABLED = str(os.getenv("QUEUE_FAILOVER_ENABLED", "1")).strip().lower() in {"1", "true", "yes"}
 PRIMARY_QUEUE_CONGESTION_DEPTH = max(1, int(os.getenv("PRIMARY_QUEUE_CONGESTION_DEPTH", "100")))
@@ -107,6 +114,29 @@ def _build_media_url(request: Request, doc: dict, include_token: bool = True) ->
     return _public_url_for(request, path)
 
 
+def _refresh_media_doc_if_expired(doc: dict) -> dict:
+    """
+    Extend media accessibility window by rotating token and TTL when expired.
+    Keeps file_id stable across retries/DLQ replays while allowing URL refresh.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    file_id = doc.get("file_id")
+    expires_at = doc.get("expires_at")
+    now = datetime.utcnow()
+    if not file_id or not isinstance(expires_at, datetime) or expires_at > now:
+        return doc
+
+    updates = {
+        "expires_at": now + timedelta(days=MEDIA_URL_TTL_DAYS),
+        "updated_at": now,
+    }
+    if doc.get("stored_path"):
+        updates["access_token"] = secrets.token_urlsafe(24)
+    media_files_collection.update_one({"file_id": str(file_id)}, {"$set": updates})
+    return {**doc, **updates}
+
+
 def _is_publicly_reachable_url(url: Optional[str]) -> bool:
     if not url:
         return False
@@ -121,6 +151,10 @@ def _is_publicly_reachable_url(url: Optional[str]) -> bool:
     hostname = (parsed.hostname or "").strip().lower()
     if not hostname:
         return False
+    if hostname in ALLOWED_PRIVATE_MEDIA_HOSTS:
+        return True
+    if ALLOW_PRIVATE_MEDIA_URLS:
+        return True
     if hostname in {"localhost", "0.0.0.0"} or hostname.endswith(".local"):
         return False
 
@@ -164,9 +198,10 @@ def _normalize_attachments(request: Request, content: dict) -> dict:
         mime_type = a.get("mime_type") or (a.get("content_type"))
         size_bytes = a.get("size_bytes")
 
-        if file_id and not url:
+        if file_id:
             doc = media_files_collection.find_one({"file_id": str(file_id)}, {"_id": 0})
             if doc:
+                doc = _refresh_media_doc_if_expired(doc)
                 url = _build_media_url(request, doc, include_token=True)
                 name = name or doc.get("original_name")
                 mime_type = mime_type or doc.get("mime_type")
@@ -2295,6 +2330,20 @@ def notify(
             # ─────────────────────────────────────────────────────────────────
 
             recipient_address = CHANNEL_ADDRESS_MAP.get(channel, lambda r: None)(recipient_dict)
+            if not recipient_address:
+                required_field = {
+                    "email": "email",
+                    "sms": "phone",
+                    "whatsapp": "wa_number",
+                    "push": "fcm_token",
+                }.get(channel, "recipient address")
+                jobs_blocked.append({
+                    "user_id": recipient.user_id,
+                    "channel": channel,
+                    "reason":  f"Missing {required_field} for {channel} notification.",
+                })
+                print(f"[RECIPIENT] Blocked {channel} for user={recipient.user_id}: missing {required_field}")
+                continue
 
             queue_name = _select_queue_for_dispatch(channel)
 
@@ -2432,6 +2481,7 @@ async def upload_media(
             "size_bytes": int(size_bytes) if isinstance(size_bytes, int) and size_bytes >= 0 else None,
             "source_url": normalized_url,
             "delivery_mode": normalized_delivery_mode or "link_only",
+            "expires_at": datetime.utcnow() + timedelta(days=MEDIA_URL_TTL_DAYS),
             "created_at": datetime.utcnow(),
         }
         media_files_collection.insert_one(doc)
@@ -2442,6 +2492,7 @@ async def upload_media(
             "mime_type": resolved_mime,
             "size_bytes": doc["size_bytes"],
             "delivery_mode": doc["delivery_mode"],
+            "expires_at": doc["expires_at"],
             "storage": "remote_url",
         }
 
@@ -2480,6 +2531,7 @@ async def upload_media(
         "stored_path": str(dest),
         "access_token": access_token,
         "delivery_mode": normalized_delivery_mode or "auto",
+        "expires_at": datetime.utcnow() + timedelta(days=MEDIA_URL_TTL_DAYS),
         "created_at": datetime.utcnow(),
     }
     media_files_collection.insert_one(doc)
@@ -2492,6 +2544,7 @@ async def upload_media(
         "mime_type": mime_type,
         "size_bytes": size,
         "delivery_mode": doc["delivery_mode"],
+        "expires_at": doc["expires_at"],
         "storage": "local_file",
     }
 
@@ -2505,15 +2558,25 @@ def get_media(
     doc = media_files_collection.find_one({"file_id": file_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
+
+    expires_at = doc.get("expires_at")
+    is_expired = isinstance(expires_at, datetime) and expires_at <= datetime.utcnow()
+
     # Allow either:
     #  - authenticated access (dashboard / internal)
     #  - tokenized public access (for providers fetching media URLs)
-    if api_client and doc.get("client_id") == api_client.get("client_id"):
+    is_owner = bool(api_client and doc.get("client_id") == api_client.get("client_id"))
+    if is_owner:
         allowed = True
     else:
         allowed = token and hmac.compare_digest(str(token), str(doc.get("access_token") or ""))
     if not allowed:
         raise HTTPException(status_code=403, detail="Not allowed")
+    if not is_owner and is_expired:
+        raise HTTPException(status_code=410, detail="Media URL expired")
+    if is_owner and is_expired:
+        doc = _refresh_media_doc_if_expired(doc)
+
     if doc.get("source_url"):
         return RedirectResponse(url=str(doc["source_url"]), status_code=307)
     path = doc.get("stored_path")

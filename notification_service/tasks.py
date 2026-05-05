@@ -16,15 +16,24 @@ from typing import Optional
 import requests as http_requests
 import uuid
 import os
+import io
 import smtplib
 import html
 import time
 import re
 import mimetypes
+import tempfile
 from email.mime.text import MIMEText
 from urllib.parse import urlparse, parse_qs
 
 load_dotenv()
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+except Exception:  # pragma: no cover - handled at runtime with a clear error
+    GoogleAuthRequest = None
+    service_account = None
 
 # ── DB connection inside worker process ──────────────────────────────────────
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
@@ -36,6 +45,13 @@ queue_controls_collection    = _db["queue_controls"]
 queue_rate_counters_collection = _db["queue_rate_counters"]
 clients_collection           = _db["clients"]
 webhook_calls_collection     = _db["webhook_calls"]
+media_files_collection       = _db["media_files"]
+
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+MEDIA_URL_TTL_DAYS = max(1, int(os.getenv("MEDIA_URL_TTL_DAYS", "30")))
+FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+_fcm_credentials = None
+_fcm_project_id = None
 
 
 def _emit_client_webhook(event: dict) -> None:
@@ -78,6 +94,59 @@ def _emit_client_webhook(event: dict) -> None:
             })
     except Exception:
         return
+
+
+def _refresh_content_attachment_urls(content: dict) -> dict:
+    """
+    Resolve/refresh attachment URLs from stable file_id references.
+    This keeps retries/DLQ replays resilient when a previous URL token expires.
+    """
+    payload = dict(content or {})
+    attachments = payload.get("attachments")
+    if not isinstance(attachments, list):
+        return payload
+
+    now = datetime.utcnow()
+    refreshed = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        updated = dict(attachment)
+        file_id = updated.get("file_id")
+        if file_id:
+            doc = media_files_collection.find_one({"file_id": str(file_id)}, {"_id": 0})
+            if doc:
+                expires_at = doc.get("expires_at")
+                if isinstance(expires_at, datetime) and expires_at <= now:
+                    updates = {
+                        "expires_at": now + timedelta(days=MEDIA_URL_TTL_DAYS),
+                        "updated_at": now,
+                    }
+                    if doc.get("stored_path"):
+                        updates["access_token"] = uuid.uuid4().hex
+                    media_files_collection.update_one({"file_id": str(file_id)}, {"$set": updates})
+                    doc.update(updates)
+
+                if doc.get("source_url"):
+                    updated["url"] = str(doc["source_url"])
+                elif PUBLIC_BASE_URL and doc.get("file_id"):
+                    token = str(doc.get("access_token") or "")
+                    path = f"/media/{doc['file_id']}"
+                    if token:
+                        path = f"{path}?token={token}"
+                    updated["url"] = f"{PUBLIC_BASE_URL}{path}"
+
+                updated["name"] = updated.get("name") or doc.get("original_name")
+                updated["mime_type"] = updated.get("mime_type") or doc.get("mime_type")
+                if updated.get("size_bytes") is None and isinstance(doc.get("size_bytes"), int):
+                    updated["size_bytes"] = doc.get("size_bytes")
+                if updated.get("delivery_mode") is None and doc.get("delivery_mode"):
+                    updated["delivery_mode"] = doc.get("delivery_mode")
+
+        refreshed.append(updated)
+
+    payload["attachments"] = refreshed
+    return payload
 
 
 def _get_channel_control(channel: str) -> dict:
@@ -527,26 +596,55 @@ def send_whatsapp(recipient_address: str, content: dict) -> dict:
             if mime_type.startswith("video/") or name.lower().endswith((".mp4", ".mov", ".mkv", ".webm")):
                 endpoint = "video"
             try:
-                resp = http_requests.post(
-                    f"https://api.ultramsg.com/{instance_id}/messages/{endpoint}",
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    data={
-                        "token": token,
-                        "to": phone,
-                        # UltraMsg commonly accepts media as URL fields named by type.
-                        # If the provider expects a different key, we still fall back to link-only text.
-                        endpoint: normalized_url,
-                        "filename": name,
-                        "caption": "",
-                    },
-                    timeout=20,
-                )
-                data_media = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
-                if str(data_media.get("sent")).lower() == "true" or str(data_media.get("status")).lower() == "success":
-                    mid = str(data_media.get("id") or data_media.get("sid") or uuid.uuid4().hex[:10])
-                    sent_media_ids.append(mid)
-                else:
-                    attachment_urls.append((name, original_url))
+                sent_via_proxy = False
+                # Proxy-download the file ourselves so ngrok / auth-gated URLs work.
+                try:
+                    dl = http_requests.get(
+                        normalized_url,
+                        headers={"ngrok-skip-browser-warning": "true", "User-Agent": "NotificationWorker/1.0"},
+                        timeout=30,
+                        stream=True,
+                    )
+                    if dl.status_code == 200:
+                        file_bytes = dl.content
+                        resp = http_requests.post(
+                            f"https://api.ultramsg.com/{instance_id}/messages/{endpoint}",
+                            data={
+                                "token": token,
+                                "to": phone,
+                                "filename": name,
+                                "caption": "",
+                            },
+                            files={endpoint: (name, io.BytesIO(file_bytes), mime_type or "application/octet-stream")},
+                            timeout=30,
+                        )
+                        data_media = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+                        if str(data_media.get("sent")).lower() == "true" or str(data_media.get("status")).lower() == "success":
+                            mid = str(data_media.get("id") or data_media.get("sid") or uuid.uuid4().hex[:10])
+                            sent_media_ids.append(mid)
+                            sent_via_proxy = True
+                except Exception:
+                    pass
+                # Fall back to URL-based send if proxy download failed
+                if not sent_via_proxy:
+                    resp = http_requests.post(
+                        f"https://api.ultramsg.com/{instance_id}/messages/{endpoint}",
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        data={
+                            "token": token,
+                            "to": phone,
+                            endpoint: normalized_url,
+                            "filename": name,
+                            "caption": "",
+                        },
+                        timeout=20,
+                    )
+                    data_media = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+                    if str(data_media.get("sent")).lower() == "true" or str(data_media.get("status")).lower() == "success":
+                        mid = str(data_media.get("id") or data_media.get("sid") or uuid.uuid4().hex[:10])
+                        sent_media_ids.append(mid)
+                    else:
+                        attachment_urls.append((name, original_url))
             except Exception:
                 attachment_urls.append((name, original_url))
     else:
@@ -590,39 +688,107 @@ def send_whatsapp(recipient_address: str, content: dict) -> dict:
         }
     raise RuntimeError(f"UltraMsg error: {data}")
 
+def _load_fcm_credentials():
+    """
+    Load Firebase service-account credentials for FCM HTTP v1.
+    Accepts either:
+      FCM_SERVICE_ACCOUNT_JSON  raw service-account JSON
+      FCM_SERVICE_ACCOUNT_FILE  path to a service-account JSON file
+      GOOGLE_APPLICATION_CREDENTIALS  standard Google credentials path
+    """
+    global _fcm_credentials, _fcm_project_id
+
+    if _fcm_credentials is not None:
+        return _fcm_credentials, _fcm_project_id
+
+    if service_account is None or GoogleAuthRequest is None:
+        raise RuntimeError("google-auth is required for FCM HTTP v1. Install the google-auth package.")
+
+    json_value = (os.getenv("FCM_SERVICE_ACCOUNT_JSON") or "").strip()
+    file_path = (
+        os.getenv("FCM_SERVICE_ACCOUNT_FILE")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or ""
+    ).strip()
+
+    if json_value:
+        try:
+            import json
+            info = json.loads(json_value)
+        except Exception as exc:
+            raise ValueError("FCM_SERVICE_ACCOUNT_JSON must be valid service-account JSON") from exc
+        creds = service_account.Credentials.from_service_account_info(info, scopes=[FCM_SCOPE])
+        project_id = os.getenv("FCM_PROJECT_ID") or info.get("project_id")
+    elif file_path:
+        creds = service_account.Credentials.from_service_account_file(file_path, scopes=[FCM_SCOPE])
+        project_id = os.getenv("FCM_PROJECT_ID") or getattr(creds, "project_id", None)
+    else:
+        raise ValueError(
+            "FCM service-account credentials are not configured. Set FCM_SERVICE_ACCOUNT_JSON "
+            "or FCM_SERVICE_ACCOUNT_FILE for Firebase Cloud Messaging HTTP v1."
+        )
+
+    if not project_id:
+        raise ValueError("FCM_PROJECT_ID is required when it is not present in the service-account credentials.")
+
+    _fcm_credentials = creds
+    _fcm_project_id = project_id
+    return _fcm_credentials, _fcm_project_id
+
+
+def _fcm_access_token() -> str:
+    creds, _ = _load_fcm_credentials()
+    if not creds.valid or creds.expired:
+        creds.refresh(GoogleAuthRequest())
+    return creds.token
+
+
 def send_push(recipient_address: str, content: dict) -> dict:
     """
-    Firebase Cloud Messaging (FCM) legacy HTTP API.
+    Firebase Cloud Messaging (FCM) HTTP v1 API.
     .env keys needed:
-      FCM_SERVER_KEY  — from Firebase Console → Project Settings → Cloud Messaging
+      FCM_SERVICE_ACCOUNT_JSON or FCM_SERVICE_ACCOUNT_FILE
+      FCM_PROJECT_ID when project_id is not included in the credentials
     recipient_address is the device FCM token.
     """
-    server_key = os.getenv("FCM_SERVER_KEY")
-    if not server_key:
-        raise ValueError("FCM_SERVER_KEY not set in .env")
+    if not recipient_address:
+        raise ValueError("Missing FCM token for push recipient")
+
+    _, project_id = _load_fcm_credentials()
 
     title = content.get("title", content.get("subject", "Notification"))
     body  = content.get("body", "")
+    data_payload = {
+        str(k): str(v)
+        for k, v in (content or {}).items()
+        if v is not None and isinstance(v, (str, int, float, bool))
+    }
 
     # Limits are enforced at the API layer (enforce_channel_limits in main.py)
     # before the job reaches this worker — title<=65, body<=240.
     # The [:65] and [:240] below are kept as a final safety net only.
     response = http_requests.post(
-        "https://fcm.googleapis.com/fcm/send",
-        headers={"Authorization": f"key={server_key}", "Content-Type": "application/json"},
+        f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send",
+        headers={"Authorization": f"Bearer {_fcm_access_token()}", "Content-Type": "application/json"},
         json={
-            "to": recipient_address,
-            "notification": {"title": title[:65], "body": body[:240]},
-            "data": content,
+            "message": {
+                "token": recipient_address,
+                "notification": {"title": str(title)[:65], "body": str(body)[:240]},
+                "data": data_payload,
+            }
         },
         timeout=10,
     )
-    data = response.json()
-    if response.status_code == 200 and data.get("success", 0) == 1:
-        msg_id = data.get("results", [{}])[0].get("message_id", f"fcm_{uuid.uuid4().hex[:10]}")
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if 200 <= response.status_code < 300 and data.get("name"):
+        msg_id = data["name"]
         return {"provider": "firebase_fcm", "provider_message_id": msg_id, "status": "SENT", "error": None}
 
-    error = data.get("results", [{}])[0].get("error", "Unknown FCM error")
+    error = data.get("error") or data
     raise RuntimeError(f"FCM error: {error}")
 
 # ── PROVIDER ROUTER ──────────────────────────────────────────────────────────
@@ -850,6 +1016,7 @@ def _process_single_job_in_batch(job: dict) -> None:
         job_content.setdefault("_channel", channel)
         job_content.setdefault("_recipient_user_id", (job.get("recipient") or {}).get("user_id"))
         job_content.setdefault("_recipient_address", job.get("recipient_address"))
+        job_content = _refresh_content_attachment_urls(job_content)
         job["content"] = job_content
         job["channel"] = channel
 
@@ -1116,6 +1283,7 @@ def send_notification(self, job: dict):
         job_content.setdefault("_channel", channel)
         job_content.setdefault("_recipient_user_id", (job.get("recipient") or {}).get("user_id"))
         job_content.setdefault("_recipient_address", job.get("recipient_address"))
+        job_content = _refresh_content_attachment_urls(job_content)
         job["content"] = job_content
 
         # ── Admin controls: pause + rate limit (per channel) ────────────────
